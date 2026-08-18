@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 
 from openpi.models_pytorch import preprocessing_pytorch
@@ -10,9 +12,78 @@ from openpi.models_pytorch.pi05_aux_queries import TokenSpan
 from openpi.models_pytorch.pi05_aux_queries import build_explicit_aux_prefix_attention
 from openpi.models_pytorch.pi05_aux_queries import build_explicit_aux_train_attention
 from openpi.models_pytorch.pi05_aux_queries import build_native_semantic_lm_attention
+from openpi.models_pytorch.pi05_aux_queries import create_pytorch_model
+from openpi.models_pytorch.pi05_aux_queries import load_trained_pytorch_model
 from openpi.models_pytorch.policy_aux_preprocessing import patch_foreground_coverage
 from openpi.models_pytorch.policy_aux_preprocessing import preprocess_observation_and_ground_masks_pytorch
 from openpi.models_pytorch.policy_aux_preprocessing import raw_opengl_mask_to_policy_canvas
+
+
+def _train_config(mode: str | None):
+    policy_aux = None
+    if mode is not None:
+        policy_aux = SimpleNamespace(
+            mode=mode,
+            num_ground_queries=8,
+            num_geometry_queries=8,
+            ground_mask_dim=256,
+            ground_focal_alpha=0.25,
+            ground_focal_gamma=2.0,
+            lambda_geo=0.15,
+            lambda_ground=0.50 if mode == "ground_geometry_semantic_lm" else None,
+            lambda_sem=0.01 if mode == "ground_geometry_semantic_lm" else None,
+            policy_manifest_path="/unusable/semantic-and-grounding",
+            geometry_target_index_path="/unusable/geometry",
+        )
+    return SimpleNamespace(model=object(), policy_aux=policy_aux)
+
+
+def test_shared_factory_selects_plain_or_aux_and_drops_teacher_paths(monkeypatch) -> None:
+    class FakePlain:
+        def __init__(self, config) -> None:
+            self.config = config
+
+    class FakeAux(FakePlain):
+        def __init__(self, config, aux_config) -> None:
+            super().__init__(config)
+            self.aux_config = aux_config
+
+    monkeypatch.setattr("openpi.models_pytorch.pi05_aux_queries.PI0Pytorch", FakePlain)
+    monkeypatch.setattr("openpi.models_pytorch.pi05_aux_queries.PI05AuxPolicy", FakeAux)
+
+    plain = create_pytorch_model(_train_config(None))
+    p1 = create_pytorch_model(_train_config("geometry"))
+    p2 = create_pytorch_model(_train_config("ground_geometry_semantic_lm"))
+
+    assert type(plain) is FakePlain
+    assert type(p1) is FakeAux
+    assert type(p2) is FakeAux
+    assert p1.aux_config.mode == "geometry"
+    assert p2.aux_config.mode == "ground_geometry_semantic_lm"
+    for model in (p1, p2):
+        assert model.aux_config.semantic_annotation_root is None
+        assert model.aux_config.ground_mask_root is None
+        assert model.aux_config.geometry_cache_root is None
+        assert model.aux_config.geometry_normalization_path is None
+
+
+def test_trained_checkpoint_loader_is_strict(monkeypatch) -> None:
+    model = object()
+    observed = {}
+    monkeypatch.setattr("openpi.models_pytorch.pi05_aux_queries.create_pytorch_model", lambda _: model)
+
+    def fake_load(loaded_model, weight_path, *, strict, device):
+        observed.update(model=loaded_model, weight_path=weight_path, strict=strict, device=device)
+        return set(), []
+
+    monkeypatch.setattr("openpi.models_pytorch.pi05_aux_queries.safetensors.torch.load_model", fake_load)
+    assert load_trained_pytorch_model(_train_config("geometry"), "/checkpoint/model.safetensors") is model
+    assert observed == {
+        "model": model,
+        "weight_path": "/checkpoint/model.safetensors",
+        "strict": True,
+        "device": "cpu",
+    }
 
 
 def _p2_layout() -> PrefixLayout:

@@ -42,11 +42,11 @@ import tqdm
 import wandb
 
 import openpi.models.pi0_config
-import openpi.models_pytorch.pi0_pytorch
 import openpi.models_pytorch.pi05_aux_queries as _pi05_aux
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.pytorch_resume as _pytorch_resume
 
 
 def init_logging():
@@ -205,56 +205,93 @@ def should_save_checkpoint(global_step: int, config: _config.TrainConfig) -> boo
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
-    """Save a checkpoint with model state, optimizer state, and metadata."""
+def save_checkpoint(
+    model,
+    optimizer,
+    global_step,
+    config,
+    is_main,
+    data_config,
+    data_loader,
+    *,
+    micro_step_in_update: int,
+):
+    """Save model/optimizer plus per-rank exact-continuation state."""
+    if not should_save_checkpoint(global_step, config):
+        return
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    local_training_state = _pytorch_resume.capture_training_state(
+        data_loader,
+        micro_step_in_update=micro_step_in_update,
+        rank=rank,
+        world_size=world_size,
+    )
+    if dist.is_initialized():
+        rank_states = [None] * world_size if is_main else None
+        dist.gather_object(local_training_state, rank_states, dst=0)
+    else:
+        rank_states = [local_training_state]
     if not is_main:
         return
 
-    # Only save if it's time to save or if it's the final step
-    if should_save_checkpoint(global_step, config):
-        # Create temporary directory for atomic checkpoint saving
-        final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
-        tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+    if rank_states is None or any(state is None for state in rank_states):
+        raise RuntimeError("Failed to gather exact-resume state from every DDP rank")
 
-        # Remove any existing temp directory and create new one
-        if tmp_ckpt_dir.exists():
-            shutil.rmtree(tmp_ckpt_dir)
-        tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
+    # Only rank 0 writes the atomically published checkpoint.
+    final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+    tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
 
-        # Save model state using safetensors (handle shared tensors)
-        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+    # Remove any existing temp directory and create new one
+    if tmp_ckpt_dir.exists():
+        shutil.rmtree(tmp_ckpt_dir)
+    tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-        # Save optimizer state using PyTorch format
-        torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
+    # Save model state using safetensors (handle shared tensors)
+    model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
-        # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
-        metadata = {
-            "global_step": global_step,
-            "config": dataclasses.asdict(config),
-            "timestamp": time.time(),
-        }
-        torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+    # Save optimizer state using PyTorch format
+    torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
 
-        # save norm stats
-        norm_stats = data_config.norm_stats
-        if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
+    # Save training metadata (avoid saving full config to prevent JAX/Flax compatibility issues)
+    metadata = {
+        "global_step": global_step,
+        "config": dataclasses.asdict(config),
+        "timestamp": time.time(),
+        "resume_semantics": "EXACT_CONTINUATION",
+        "gradient_accumulation_boundary": micro_step_in_update,
+    }
+    torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
+    torch.save(
+        {
+            "schema": "openpi.pytorch_resume_state.v1",
+            "world_size": world_size,
+            "rank_states": rank_states,
+        },
+        tmp_ckpt_dir / "training_state.pt",
+    )
 
-        # Atomically move temp directory to final location
-        if final_ckpt_dir.exists():
-            shutil.rmtree(final_ckpt_dir)
-        tmp_ckpt_dir.rename(final_ckpt_dir)
+    # save norm stats
+    norm_stats = data_config.norm_stats
+    if norm_stats is not None and data_config.asset_id is not None:
+        _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
 
-        logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+    # Atomically move temp directory to final location
+    if final_ckpt_dir.exists():
+        shutil.rmtree(final_ckpt_dir)
+    tmp_ckpt_dir.rename(final_ckpt_dir)
 
-        # Log checkpoint to wandb
-        if config.wandb_enabled:
-            wandb.log({"checkpoint_step": global_step}, step=global_step)
+    logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
+
+    # Log checkpoint to wandb
+    if config.wandb_enabled:
+        wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
-    """Load the latest checkpoint and return the global step."""
+def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, config):
+    """Load the latest checkpoint and restore exact per-rank continuation state."""
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
@@ -280,7 +317,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            safetensors.torch.load_model(model_to_load, safetensors_path, device=str(device))
+            safetensors.torch.load_model(model_to_load, safetensors_path, strict=True, device=str(device))
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
@@ -307,12 +344,50 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
 
         # Load metadata
         logging.info("Loading metadata...")
-        metadata = torch.load(ckpt_dir / "metadata.pt", map_location=device, weights_only=False)
+        metadata = torch.load(ckpt_dir / "metadata.pt", map_location="cpu", weights_only=False)
         global_step = metadata.get("global_step", latest_step)
+        if metadata.get("resume_semantics") != "EXACT_CONTINUATION":
+            raise RuntimeError(
+                "Checkpoint predates exact-continuation state. Resume is intentionally refused instead of "
+                "silently restarting the data stream."
+            )
+        saved_config = metadata.get("config")
+        current_config = dataclasses.asdict(config)
+        if saved_config is None:
+            raise RuntimeError("Exact-resume checkpoint is missing its training config")
+        # These flags control entry into the resume path, not the trajectory.
+        for runtime_flag in ("resume", "overwrite"):
+            saved_config[runtime_flag] = False
+            current_config[runtime_flag] = False
+        if saved_config != current_config:
+            raise RuntimeError("Exact resume requires the original training config")
         del metadata
         torch.cuda.empty_cache()
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_metadata")
+
+        training_state_path = ckpt_dir / "training_state.pt"
+        if not training_state_path.exists():
+            raise FileNotFoundError(f"Exact-resume state is missing: {training_state_path}")
+        training_state = torch.load(training_state_path, map_location="cpu", weights_only=False)
+        if training_state.get("schema") != "openpi.pytorch_resume_state.v1":
+            raise RuntimeError(f"Unsupported exact-resume payload: {training_state.get('schema')}")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        if int(training_state["world_size"]) != world_size:
+            raise RuntimeError(
+                "Exact resume requires the original world size: "
+                f"saved={training_state['world_size']}, current={world_size}"
+            )
+        rank_states = training_state["rank_states"]
+        if len(rank_states) != world_size:
+            raise RuntimeError("Exact-resume payload does not contain one state per rank")
+        _pytorch_resume.restore_training_state(
+            rank_states[rank],
+            data_loader,
+            rank=rank,
+            world_size=world_size,
+        )
 
         logging.info(f"Successfully loaded all checkpoint components from step {latest_step}")
         return global_step
@@ -479,25 +554,7 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    if config.policy_aux is None:
-        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
-    else:
-        policy_aux_config = _pi05_aux.PolicyAuxConfig(
-            mode=config.policy_aux.mode,
-            num_ground_queries=config.policy_aux.num_ground_queries,
-            num_geometry_queries=config.policy_aux.num_geometry_queries,
-            ground_mask_dim=config.policy_aux.ground_mask_dim,
-            ground_focal_alpha=config.policy_aux.ground_focal_alpha,
-            ground_focal_gamma=config.policy_aux.ground_focal_gamma,
-            lambda_sem=config.policy_aux.lambda_sem,
-            lambda_ground=config.policy_aux.lambda_ground,
-            lambda_geo=config.policy_aux.lambda_geo,
-            semantic_annotation_root=config.policy_aux.policy_manifest_path,
-            ground_mask_root=config.policy_aux.policy_manifest_path,
-            geometry_cache_root=config.policy_aux.geometry_target_index_path,
-            geometry_normalization_path=config.policy_aux.geometry_normalization_path,
-        )
-        model = _pi05_aux.PI05AuxPolicy(model_cfg, policy_aux_config).to(device)
+    model = _pi05_aux.create_pytorch_model(config, model_config=model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -558,7 +615,7 @@ def train_loop(config: _config.TrainConfig):
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, loader, config)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -772,7 +829,16 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(
+                model,
+                optim,
+                global_step,
+                config,
+                is_main,
+                data_config,
+                loader,
+                micro_step_in_update=micro_step_in_update,
+            )
             if use_ddp and should_save_checkpoint(global_step, config):
                 # Keep non-writing ranks from entering the next forward while
                 # rank 0 is still writing a large atomic checkpoint.

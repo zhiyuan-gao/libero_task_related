@@ -2,6 +2,7 @@ from collections.abc import Iterator, Sequence
 import logging
 import multiprocessing
 import os
+import random
 import typing
 from typing import Literal, Protocol, SupportsIndex, TypeVar
 
@@ -442,7 +443,11 @@ class TorchDataLoader:
             )
         self._num_batches = num_batches
         self._sampler = sampler
-        self._distributed_epoch = 0
+        self._epoch = 0
+        self._batch_in_epoch = 0
+        self._total_batches_yielded = 0
+        self._epoch_start_generator_state = None
+        self._resume_pending = False
 
         mp_context = None
         if num_workers > 0:
@@ -450,6 +455,7 @@ class TorchDataLoader:
 
         generator = torch.Generator()
         generator.manual_seed(seed)
+        self._generator = generator
         self._data_loader = torch.utils.data.DataLoader(
             typing.cast(torch.utils.data.Dataset, dataset),
             batch_size=local_batch_size,
@@ -468,21 +474,106 @@ class TorchDataLoader:
     def torch_loader(self) -> torch.utils.data.DataLoader:
         return self._data_loader
 
+    def state_dict(self) -> dict:
+        """Capture the exact epoch and batch position for trajectory-exact resume."""
+
+        epoch_start = self._epoch_start_generator_state
+        if epoch_start is None:
+            epoch_start = self._generator.get_state()
+        sampler_state = None
+        if isinstance(self._sampler, torch.utils.data.distributed.DistributedSampler):
+            sampler_state = {
+                "type": type(self._sampler).__qualname__,
+                "num_replicas": self._sampler.num_replicas,
+                "rank": self._sampler.rank,
+                "shuffle": self._sampler.shuffle,
+                "seed": self._sampler.seed,
+                "drop_last": self._sampler.drop_last,
+            }
+        return {
+            "schema": "openpi.torch_data_loader_state.v1",
+            "epoch": self._epoch,
+            "batch_in_epoch": self._batch_in_epoch,
+            "total_batches_yielded": self._total_batches_yielded,
+            "epoch_start_generator_state": epoch_start.clone(),
+            "epoch_length": len(self._data_loader),
+            "dataset_length": len(self._data_loader.dataset),
+            "batch_size": self._data_loader.batch_size,
+            "drop_last": self._data_loader.drop_last,
+            "distributed_sampler": sampler_state,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Schedule a deterministic replay to the saved within-epoch position."""
+
+        if state.get("schema") != "openpi.torch_data_loader_state.v1":
+            raise ValueError(f"Unsupported data-loader resume state: {state.get('schema')}")
+        epoch = int(state["epoch"])
+        batch_in_epoch = int(state["batch_in_epoch"])
+        total_batches_yielded = int(state["total_batches_yielded"])
+        if epoch < 0 or batch_in_epoch < 0 or total_batches_yielded < 0:
+            raise ValueError("Data-loader resume counters must be non-negative")
+        current_state = self.state_dict()
+        for name in ("epoch_length", "dataset_length", "batch_size", "drop_last", "distributed_sampler"):
+            if state[name] != current_state[name]:
+                raise ValueError(
+                    f"Exact resume data-loader mismatch for {name}: saved={state[name]}, current={current_state[name]}"
+                )
+        if batch_in_epoch > len(self._data_loader):
+            raise ValueError(f"Saved batch offset {batch_in_epoch} exceeds epoch length {len(self._data_loader)}")
+        generator_state = state["epoch_start_generator_state"]
+        if not isinstance(generator_state, torch.Tensor) or generator_state.device.type != "cpu":
+            raise ValueError("Data-loader generator state must be a CPU tensor")
+        self._epoch = epoch
+        self._batch_in_epoch = batch_in_epoch
+        self._total_batches_yielded = total_batches_yielded
+        self._epoch_start_generator_state = generator_state.clone()
+        self._resume_pending = True
+
     def __iter__(self):
-        num_items = 0
         while True:
+            if self._num_batches is not None and self._total_batches_yielded >= self._num_batches:
+                return
+
+            skip_batches = 0
+            if self._resume_pending:
+                self._generator.set_state(self._epoch_start_generator_state)
+                skip_batches = self._batch_in_epoch
+                self._resume_pending = False
+            else:
+                self._batch_in_epoch = 0
+                self._epoch_start_generator_state = self._generator.get_state().clone()
             if isinstance(self._sampler, torch.utils.data.distributed.DistributedSampler):
-                self._sampler.set_epoch(self._distributed_epoch)
-                self._distributed_epoch += 1
+                self._sampler.set_epoch(self._epoch)
             data_iter = iter(self._data_loader)
+            # Replaying already-consumed batches restores the sampler/worker
+            # position. Preserve main-process RNG in case a dataset transform
+            # happens to use Python, NumPy, or torch randomness while replaying.
+            replay_rng = (random.getstate(), np.random.get_state(), torch.get_rng_state())
+            try:
+                for _ in range(skip_batches):
+                    try:
+                        next(data_iter)
+                    except StopIteration as error:
+                        raise RuntimeError(
+                            f"Cannot restore batch {skip_batches} within data-loader epoch {self._epoch}"
+                        ) from error
+            finally:
+                random.setstate(replay_rng[0])
+                np.random.set_state(replay_rng[1])
+                torch.set_rng_state(replay_rng[2])
             while True:
-                if self._num_batches is not None and num_items >= self._num_batches:
+                if self._num_batches is not None and self._total_batches_yielded >= self._num_batches:
                     return
                 try:
                     batch = next(data_iter)
                 except StopIteration:
+                    self._epoch += 1
+                    self._batch_in_epoch = 0
+                    self._epoch_start_generator_state = None
                     break  # We've exhausted the dataset. Create a new iterator and start over.
-                num_items += 1
+                self._batch_in_epoch += 1
+                self._total_batches_yielded += 1
                 # For JAX, convert to sharded arrays; for PyTorch, return torch tensors
                 if self._sharding is not None:
                     yield jax.tree.map(lambda x: jax.make_array_from_process_local_data(self._sharding, x), batch)
@@ -556,6 +647,16 @@ class DataLoaderImpl(DataLoader):
 
     def data_config(self) -> _config.DataConfig:
         return self._data_config
+
+    def state_dict(self) -> dict:
+        if not isinstance(self._data_loader, TorchDataLoader):
+            raise TypeError("Exact resume state is available only for the PyTorch TorchDataLoader")
+        return self._data_loader.state_dict()
+
+    def load_state_dict(self, state: dict) -> None:
+        if not isinstance(self._data_loader, TorchDataLoader):
+            raise TypeError("Exact resume state is available only for the PyTorch TorchDataLoader")
+        self._data_loader.load_state_dict(state)
 
     def __iter__(self):
         for batch in self._data_loader:

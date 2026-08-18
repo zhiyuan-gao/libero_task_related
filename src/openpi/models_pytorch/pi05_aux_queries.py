@@ -70,6 +70,52 @@ class PolicyAuxConfig:
                 raise ValueError(f"{name} must be non-negative")
 
 
+def policy_aux_config_from_train_config(train_config) -> PolicyAuxConfig | None:
+    """Translate the trainer config into the inference-safe model config.
+
+    Teacher/cache paths intentionally do not cross this boundary: they belong to
+    the training dataset, while the trained policy needs only its learned
+    parameters and the frozen architectural/loss metadata.
+    """
+
+    policy_aux = train_config.policy_aux
+    if policy_aux is None:
+        return None
+    return PolicyAuxConfig(
+        mode=policy_aux.mode,
+        num_ground_queries=policy_aux.num_ground_queries,
+        num_geometry_queries=policy_aux.num_geometry_queries,
+        ground_mask_dim=policy_aux.ground_mask_dim,
+        ground_focal_alpha=policy_aux.ground_focal_alpha,
+        ground_focal_gamma=policy_aux.ground_focal_gamma,
+        lambda_geo=policy_aux.lambda_geo,
+        lambda_ground=policy_aux.lambda_ground,
+        lambda_sem=policy_aux.lambda_sem,
+    )
+
+
+def create_pytorch_model(train_config, *, model_config=None) -> PI0Pytorch:
+    """Create the canonical PyTorch architecture for training or serving."""
+
+    model_config = train_config.model if model_config is None else model_config
+    policy_aux_config = policy_aux_config_from_train_config(train_config)
+    if policy_aux_config is None:
+        return PI0Pytorch(model_config)
+    return PI05AuxPolicy(model_config, policy_aux_config)
+
+
+def load_trained_pytorch_model(train_config, weight_path: str, *, device: str = "cpu") -> PI0Pytorch:
+    """Strict-load a complete trained checkpoint through the canonical factory."""
+
+    model = create_pytorch_model(train_config)
+    missing, unexpected = safetensors.torch.load_model(model, weight_path, strict=True, device=device)
+    if missing or unexpected:
+        raise RuntimeError(
+            f"Strict trained checkpoint mismatch: missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+        )
+    return model
+
+
 @dataclasses.dataclass(frozen=True)
 class TokenSpan:
     start: int
