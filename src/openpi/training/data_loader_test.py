@@ -1,6 +1,7 @@
 import dataclasses
 
 import jax
+import torch
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
@@ -32,6 +33,30 @@ def test_torch_data_loader_infinite():
 
     for _ in range(10):
         _ = next(data_iter)
+
+
+def test_distributed_sampler_epoch_advances_when_infinite_loader_restarts():
+    config = pi0_config.Pi0Config(action_dim=24, action_horizon=50, max_token_len=48)
+    dataset = _data_loader.FakeDataset(config, 4)
+
+    class RecordingSampler(torch.utils.data.distributed.DistributedSampler):
+        def __init__(self):
+            super().__init__(dataset, num_replicas=2, rank=0, shuffle=True, drop_last=True)
+            self.epochs = []
+
+        def set_epoch(self, epoch: int) -> None:
+            self.epochs.append(epoch)
+            super().set_epoch(epoch)
+
+    sampler = RecordingSampler()
+    loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=2,
+        sampler=sampler,
+        num_batches=3,
+    )
+    assert len(list(loader)) == 3
+    assert sampler.epochs == [0, 1, 2]
 
 
 def test_torch_data_loader_parallel():

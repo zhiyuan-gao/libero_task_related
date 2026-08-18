@@ -26,6 +26,7 @@ import openpi.training.droid_rlds_dataset as droid_rlds_dataset
 import openpi.training.misc.polaris_config as polaris_config
 import openpi.training.misc.roboarena_config as roboarena_config
 import openpi.training.optimizer as _optimizer
+import openpi.training.policy_aux_dataset as _policy_aux_dataset
 import openpi.training.weight_loaders as weight_loaders
 import openpi.transforms as _transforms
 
@@ -485,6 +486,9 @@ class TrainConfig:
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
 
+    # Optional P1/P2 auxiliary policy integration. None preserves official behavior.
+    policy_aux: _policy_aux_dataset.PolicyAuxTrainConfig | None = None
+
     lr_schedule: _optimizer.LRScheduleConfig = dataclasses.field(default_factory=_optimizer.CosineDecaySchedule)
     optimizer: _optimizer.OptimizerConfig = dataclasses.field(default_factory=_optimizer.AdamW)
     ema_decay: float | None = 0.99
@@ -504,6 +508,9 @@ class TrainConfig:
     seed: int = 42
     # Global batch size.
     batch_size: int = 32
+    # Number of micro-batches accumulated per optimizer update. Effective global
+    # batch is ``batch_size * gradient_accumulation_steps``.
+    gradient_accumulation_steps: int = 1
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 2
@@ -514,6 +521,8 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # Save at the final optimizer update even when it is off the regular cadence.
+    save_final_checkpoint: bool = True
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
 
@@ -554,6 +563,46 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        frozen_policy_aux = {
+            "pi05_libero_p1_aux": {
+                "mode": "geometry",
+                "lambda_geo": 0.15,
+                "lambda_ground": None,
+                "lambda_sem": None,
+            },
+            "pi05_libero_p2_aux": {
+                "mode": "ground_geometry_semantic_lm",
+                "lambda_geo": 0.15,
+                "lambda_ground": 0.50,
+                "lambda_sem": 0.01,
+            },
+        }
+        if expected := frozen_policy_aux.get(self.name):
+            if self.policy_aux is None or not self.policy_aux.loss_coefficients_approved:
+                raise ValueError(f"{self.name} requires the human-approved frozen auxiliary protocol")
+            observed = {
+                "mode": self.policy_aux.mode,
+                "lambda_geo": self.policy_aux.lambda_geo,
+                "lambda_ground": self.policy_aux.lambda_ground,
+                "lambda_sem": self.policy_aux.lambda_sem,
+            }
+            if observed != expected:
+                raise ValueError(
+                    f"{self.name} auxiliary architecture/lambdas are frozen: expected={expected}, observed={observed}"
+                )
+
+
+# P1/P2 development paths are explicit so that the transfer manifest can rewrite
+# them mechanically on the 8-GPU target. The primary coefficients were frozen by
+# human approval on 2026-08-18 and remain identical wherever a loss is shared.
+_POLICY_AUX_ROOT = "/workspace/vla/data/libero_four_suite_annotation/policy_aux_v1"
+_POLICY_AUX_LEROBOT_ROOT = (
+    "/workspace/vla/cache/huggingface/hub/"
+    "datasets--physical-intelligence--libero/snapshots/"
+    "a4336d589d589045d1c56423ffdf3b88a0e19b1f"
+)
+_POLICY_AUX_BASE_WEIGHTS = "/workspace/vla/models/openpi/pi05_base_pytorch"
+_POLICY_AUX_LIBERO_ASSETS = "/workspace/vla/models/openpi/pi05_libero_pytorch/assets"
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -759,6 +808,80 @@ _CONFIGS = [
         ema_decay=0.999,
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_p1_aux",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        policy_aux=_policy_aux_dataset.PolicyAuxTrainConfig(
+            mode="geometry",
+            policy_manifest_path=f"{_POLICY_AUX_ROOT}/manifests/libero10_policy_aux_manifest.parquet",
+            episode_mapping_path=f"{_POLICY_AUX_ROOT}/debug/lerobot_episode_mapping.json",
+            geometry_target_index_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/target_index.parquet",
+            geometry_normalization_path=(f"{_POLICY_AUX_ROOT}/geometry_libero10/normalization/train_mean_std.json"),
+            lambda_geo=0.15,
+            lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+            loss_coefficients_approved=True,
+        ),
+        batch_size=8,
+        gradient_accumulation_steps=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # P1/P2 use the PyTorch trainer's simplest native behavior: no EMA.
+        # Keep this identical between P1 and P2; historical P0 parity is not a
+        # launch prerequisite for the current architecture-validation stage.
+        ema_decay=None,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_libero_p2_aux",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        policy_aux=_policy_aux_dataset.PolicyAuxTrainConfig(
+            mode="ground_geometry_semantic_lm",
+            policy_manifest_path=f"{_POLICY_AUX_ROOT}/manifests/libero10_policy_aux_manifest.parquet",
+            episode_mapping_path=f"{_POLICY_AUX_ROOT}/debug/lerobot_episode_mapping.json",
+            geometry_target_index_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/target_index.parquet",
+            geometry_normalization_path=(f"{_POLICY_AUX_ROOT}/geometry_libero10/normalization/train_mean_std.json"),
+            lambda_sem=0.01,
+            lambda_ground=0.50,
+            lambda_geo=0.15,
+            lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+            loss_coefficients_approved=True,
+        ),
+        batch_size=8,
+        gradient_accumulation_steps=32,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # Frozen P1/P2 protocol: no EMA (identical to P1).
+        ema_decay=None,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=30_000,
     ),
     #

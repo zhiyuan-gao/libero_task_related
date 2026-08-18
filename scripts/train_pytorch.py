@@ -23,6 +23,7 @@ Multi-Node Training:
 
 """
 
+import contextlib
 import dataclasses
 import gc
 import logging
@@ -42,6 +43,7 @@ import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
+import openpi.models_pytorch.pi05_aux_queries as _pi05_aux
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
@@ -128,6 +130,22 @@ def build_datasets(config: _config.TrainConfig):
     return data_loader, data_loader.data_config()
 
 
+def policy_aux_targets_from_batch(batch: dict) -> _pi05_aux.PolicyAuxTargets:
+    """Convert the collated immutable target tree into the model target dataclass."""
+
+    return _pi05_aux.PolicyAuxTargets(
+        geometry=batch["geometry"],
+        geometry_valid=batch["geometry_valid"],
+        geometry_mean=batch["geometry_mean"],
+        geometry_std=batch["geometry_std"],
+        ground_masks=batch.get("ground_masks"),
+        ground_valid_views=batch.get("ground_valid_views"),
+        semantic_input_ids=batch.get("semantic_input_ids"),
+        semantic_labels=batch.get("semantic_labels"),
+        semantic_loss_mask=batch.get("semantic_loss_mask"),
+    )
+
+
 def get_model_state_dict(model):
     """Get state dict from model, handling DDP wrapper."""
     return (
@@ -146,13 +164,54 @@ def get_model_parameters(model):
     )
 
 
+def reduce_scalar_metrics(values: dict[str, float], device: torch.device) -> dict[str, float]:
+    """Average scalar training metrics over DDP ranks in a fixed key order."""
+
+    if not dist.is_initialized() or dist.get_world_size() == 1:
+        return values
+    keys = sorted(values)
+    packed = torch.tensor([values[key] for key in keys], dtype=torch.float64, device=device)
+    dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+    packed /= dist.get_world_size()
+    return dict(zip(keys, packed.cpu().tolist(), strict=True))
+
+
+def auxiliary_gradient_norms(model: torch.nn.Module) -> dict[str, float]:
+    """Return raw pre-clipping norms for the small P1/P2 parameter groups."""
+
+    module = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    groups = {
+        "geometry_queries": ("geometry_queries",),
+        "geometry_head": ("geometry_head.",),
+        "ground_queries": ("ground_queries",),
+        "ground_head": ("ground_head.",),
+    }
+    squared = dict.fromkeys(groups, 0.0)
+    found = dict.fromkeys(groups, False)
+    for parameter_name, parameter in module.named_parameters():
+        if parameter.grad is None:
+            continue
+        grad_squared = float(parameter.grad.detach().float().square().sum())
+        for group_name, prefixes in groups.items():
+            if parameter_name.startswith(prefixes):
+                squared[group_name] += grad_squared
+                found[group_name] = True
+    return {f"grad_norm_{name}": value**0.5 for name, value in squared.items() if found[name]}
+
+
+def should_save_checkpoint(global_step: int, config: _config.TrainConfig) -> bool:
+    return (global_step % config.save_interval == 0 and global_step > 0) or (
+        config.save_final_checkpoint and global_step == config.num_train_steps
+    )
+
+
 def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
     """Save a checkpoint with model state, optimizer state, and metadata."""
     if not is_main:
         return
 
     # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+    if should_save_checkpoint(global_step, config):
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -307,6 +366,13 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    if config.policy_aux is not None and not config.policy_aux.loss_coefficients_approved:
+        raise RuntimeError(
+            "P1/P2 loss coefficients are not approved. Run calibration and explicitly set "
+            "policy_aux.loss_coefficients_approved=true before any optimizer step."
+        )
+    if int(os.environ.get("WORLD_SIZE", "1")) >= 8:
+        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
@@ -350,9 +416,16 @@ def train_loop(config: _config.TrainConfig):
     # Calculate effective batch size per GPU for DDP
     # For N GPUs, each GPU should get batch_size/N samples, so total across all GPUs is batch_size
     world_size = torch.distributed.get_world_size() if use_ddp else 1
-    effective_batch_size = config.batch_size // world_size
+    if config.batch_size % world_size != 0:
+        raise ValueError("Global micro-batch size must be divisible by DDP world size")
+    if config.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+    micro_batch_per_gpu = config.batch_size // world_size
+    effective_global_batch = config.batch_size * config.gradient_accumulation_steps
     logging.info(
-        f"Using batch size per GPU: {effective_batch_size} (total batch size across {world_size} GPUs: {config.batch_size})"
+        f"Using micro-batch per GPU: {micro_batch_per_gpu}; global micro-batch: "
+        f"{config.batch_size}; accumulation: {config.gradient_accumulation_steps}; "
+        f"effective global batch: {effective_global_batch}"
     )
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
@@ -364,7 +437,7 @@ def train_loop(config: _config.TrainConfig):
         sample_data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=False)
         sample_batch = next(iter(sample_data_loader))
         # Convert observation and actions to torch tensors
-        observation, actions = sample_batch
+        observation, actions = sample_batch[:2]
         sample_batch = observation.to_dict()
         sample_batch["actions"] = actions
 
@@ -406,7 +479,25 @@ def train_loop(config: _config.TrainConfig):
         # Update dtype to match pytorch_training_precision
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    if config.policy_aux is None:
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    else:
+        policy_aux_config = _pi05_aux.PolicyAuxConfig(
+            mode=config.policy_aux.mode,
+            num_ground_queries=config.policy_aux.num_ground_queries,
+            num_geometry_queries=config.policy_aux.num_geometry_queries,
+            ground_mask_dim=config.policy_aux.ground_mask_dim,
+            ground_focal_alpha=config.policy_aux.ground_focal_alpha,
+            ground_focal_gamma=config.policy_aux.ground_focal_gamma,
+            lambda_sem=config.policy_aux.lambda_sem,
+            lambda_ground=config.policy_aux.lambda_ground,
+            lambda_geo=config.policy_aux.lambda_geo,
+            semantic_annotation_root=config.policy_aux.policy_manifest_path,
+            ground_mask_root=config.policy_aux.policy_manifest_path,
+            geometry_cache_root=config.policy_aux.geometry_target_index_path,
+            geometry_normalization_path=config.policy_aux.geometry_normalization_path,
+        )
+        model = _pi05_aux.PI05AuxPolicy(model_cfg, policy_aux_config).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -425,8 +516,6 @@ def train_loop(config: _config.TrainConfig):
         torch.backends.cudnn.benchmark = True
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
-        # Set memory allocation configuration
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128,expandable_segments:True"
         logging.info("Enabled memory optimizations for 8+ GPU training")
 
     if use_ddp:
@@ -443,9 +532,12 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
+        model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+        if isinstance(model_to_load, _pi05_aux.PI05AuxPolicy) and model_to_load.aux_enabled:
+            load_result = model_to_load.load_official_base_checkpoint(model_path, device=str(device))
+            logging.info(f"Loaded official base with exact auxiliary missing keys: {load_result}")
+        else:
+            safetensors.torch.load_model(model_to_load, model_path, strict=True)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     # Optimizer + learning rate schedule from config
@@ -482,12 +574,18 @@ def train_loop(config: _config.TrainConfig):
     model.train()
     start_time = time.time()
     infos = []  # Collect stats over log interval
+    optim.zero_grad(set_to_none=True)
+    micro_step_in_update = 0
+    accumulated_loss = 0.0
+    accumulated_auxiliary_values: dict[str, float] = {}
     if is_main:
         logging.info(
             f"Running on: {platform.node()} | world_size={torch.distributed.get_world_size() if use_ddp else 1}"
         )
         logging.info(
-            f"Training config: batch_size={config.batch_size}, effective_batch_size={effective_batch_size}, num_train_steps={config.num_train_steps}"
+            f"Training config: micro_batch_per_gpu={micro_batch_per_gpu}, "
+            f"effective_global_batch={effective_global_batch}, "
+            f"num_train_steps={config.num_train_steps}"
         )
         logging.info(f"Memory optimizations: gradient_checkpointing={enable_gradient_checkpointing}")
         logging.info(
@@ -511,36 +609,76 @@ def train_loop(config: _config.TrainConfig):
         if use_ddp and hasattr(loader, "set_epoch"):
             loader.set_epoch(global_step // len(loader))
 
-        for observation, actions in loader:
+        for batch in loader:
             # Check if we've reached the target number of steps
             if global_step >= config.num_train_steps:
                 break
 
-            # The unified data loader returns (observation, actions) tuple
-            observation = jax.tree.map(lambda x: x.to(device), observation)  # noqa: PLW2901
-            actions = actions.to(torch.float32)  # noqa: PLW2901
-            actions = actions.to(device)  # noqa: PLW2901
+            if config.policy_aux is None:
+                observation, actions = batch
+                policy_aux_targets = None
+            else:
+                observation, actions, policy_aux_batch = batch
+                policy_aux_batch = jax.tree.map(lambda x: x.to(device), policy_aux_batch)
+                policy_aux_targets = policy_aux_targets_from_batch(policy_aux_batch)
+
+            observation = jax.tree.map(lambda x: x.to(device), observation)
+            actions = actions.to(torch.float32)
+            actions = actions.to(device)
 
             # Update LR
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
-            # Ensure losses is a tensor and handle different return types
-            if isinstance(losses, list | tuple):
-                losses = torch.stack(losses)
-            elif not isinstance(losses, torch.Tensor):
-                losses = torch.tensor(losses, device=device, dtype=torch.float32)
+            is_update_boundary = micro_step_in_update + 1 == config.gradient_accumulation_steps
+            sync_context = (
+                contextlib.nullcontext()
+                if not isinstance(model, torch.nn.parallel.DistributedDataParallel) or is_update_boundary
+                else model.no_sync()
+            )
+            with sync_context:
+                # Forward pass. DDP synchronization is deferred until the last
+                # micro-batch of an optimizer update.
+                if policy_aux_targets is None:
+                    losses = model(observation, actions)
+                else:
+                    losses = model(observation, actions, aux_targets=policy_aux_targets)
+                auxiliary_log_values = {}
+                if isinstance(losses, dict):
+                    auxiliary_log_values = {
+                        f"loss_{name}": float(value.detach()) for name, value in losses["losses"].items()
+                    }
+                    auxiliary_log_values.update(
+                        {
+                            name: float(value.detach())
+                            for name, value in losses["diagnostics"].items()
+                            if value.ndim == 0
+                        }
+                    )
+                    losses = losses["losses"]["total"]
+                # Ensure losses is a tensor and handle different return types.
+                if isinstance(losses, list | tuple):
+                    losses = torch.stack(losses)
+                elif not isinstance(losses, torch.Tensor):
+                    losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
-            loss = losses.mean()
+                loss = losses.mean()
+                (loss / config.gradient_accumulation_steps).backward()
 
-            # Backward pass
-            loss.backward()
+            accumulated_loss += loss.item() / config.gradient_accumulation_steps
+            for key, value in auxiliary_log_values.items():
+                accumulated_auxiliary_values[key] = (
+                    accumulated_auxiliary_values.get(key, 0.0) + value / config.gradient_accumulation_steps
+                )
+            micro_step_in_update += 1
+            if not is_update_boundary:
+                continue
 
-            # Log memory usage after backward pass
+            # Log memory usage after the synchronized backward pass.
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
+
+            accumulated_auxiliary_values.update(auxiliary_gradient_norms(model))
 
             # Gradient clipping
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
@@ -555,22 +693,41 @@ def train_loop(config: _config.TrainConfig):
                     param.grad.detach_()
                     param.grad = None
 
-            # Collect stats
+            update_loss = accumulated_loss
+            reduced_metrics = reduce_scalar_metrics(
+                {
+                    "loss": update_loss,
+                    "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                    **accumulated_auxiliary_values,
+                },
+                device,
+            )
+            update_loss = reduced_metrics["loss"]
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        **reduced_metrics,
                         "learning_rate": optim.param_groups[0]["lr"],
-                        "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
                 )
+            micro_step_in_update = 0
+            accumulated_loss = 0.0
+            accumulated_auxiliary_values = {}
 
             if is_main and (global_step % config.log_interval == 0):
                 elapsed = time.time() - start_time
+                logged_updates = len(infos)
+                steps_per_second = logged_updates / max(elapsed, 1e-9)
+                samples_per_second = effective_global_batch * steps_per_second
 
                 # Average stats over log interval
                 avg_loss = sum(info["loss"] for info in infos) / len(infos)
                 avg_lr = sum(info["learning_rate"] for info in infos) / len(infos)
+                auxiliary_averages = {
+                    key: sum(info[key] for info in infos if key in info) / sum(key in info for info in infos)
+                    for key in sorted({key for info in infos for key in info})
+                    if key not in {"loss", "learning_rate", "grad_norm"}
+                }
 
                 avg_grad_norm = None
                 if any("grad_norm" in info for info in infos):
@@ -580,10 +737,17 @@ def train_loop(config: _config.TrainConfig):
                     if len(vals) > 0:
                         avg_grad_norm = sum(vals) / len(vals)
                 logging.info(
-                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} time={elapsed:.1f}s"
+                    f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} grad_norm={avg_grad_norm:.2f} "
+                    f"steps/s={steps_per_second:.4f} samples/s={samples_per_second:.2f} time={elapsed:.1f}s"
                     if avg_grad_norm is not None
-                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} time={elapsed:.1f}s"
+                    else f"step={global_step} loss={avg_loss:.4f} lr={avg_lr:.2e} "
+                    f"steps/s={steps_per_second:.4f} samples/s={samples_per_second:.2f} time={elapsed:.1f}s"
                 )
+                if auxiliary_averages:
+                    logging.info(
+                        "Auxiliary metrics: "
+                        + " ".join(f"{key}={value:.5f}" for key, value in auxiliary_averages.items())
+                    )
 
                 # Log to wandb
                 if config.wandb_enabled and len(infos) > 0:
@@ -591,11 +755,17 @@ def train_loop(config: _config.TrainConfig):
                         "loss": avg_loss,
                         "learning_rate": avg_lr,
                         "step": global_step,
-                        "time_per_step": elapsed / config.log_interval,
+                        "time_per_step": elapsed / logged_updates,
+                        "steps_per_second": steps_per_second,
+                        "samples_per_second": samples_per_second,
                     }
                     if avg_grad_norm is not None:
                         log_payload["grad_norm"] = avg_grad_norm
+                    log_payload.update(auxiliary_averages)
                     wandb.log(log_payload, step=global_step)
+
+                if torch.cuda.is_available():
+                    log_memory_usage(device, global_step, "logging")
 
                 start_time = time.time()
                 infos = []  # Reset stats collection
@@ -603,12 +773,16 @@ def train_loop(config: _config.TrainConfig):
             global_step += 1
             # Save checkpoint using the new mechanism
             save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            if use_ddp and should_save_checkpoint(global_step, config):
+                # Keep non-writing ranks from entering the next forward while
+                # rank 0 is still writing a large atomic checkpoint.
+                dist.barrier()
 
             # Update progress bar
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {"loss": f"{update_loss:.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
                 )
 
     # Close progress bar

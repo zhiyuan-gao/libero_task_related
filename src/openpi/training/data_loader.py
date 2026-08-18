@@ -14,6 +14,7 @@ import torch
 import openpi.models.model as _model
 import openpi.training.config as _config
 from openpi.training.droid_rlds_dataset import DroidRldsDataset
+import openpi.training.policy_aux_dataset as _policy_aux_dataset
 import openpi.transforms as _transforms
 
 T_co = TypeVar("T_co", covariant=True)
@@ -128,7 +129,11 @@ class FakeDataset(Dataset):
 
 
 def create_torch_dataset(
-    data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
+    data_config: _config.DataConfig,
+    action_horizon: int,
+    model_config: _model.BaseModelConfig,
+    *,
+    policy_aux_config: _policy_aux_dataset.PolicyAuxTrainConfig | None = None,
 ) -> Dataset:
     """Create a dataset for training."""
     repo_id = data_config.repo_id
@@ -137,9 +142,15 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    episodes = None if policy_aux_config is None else policy_aux_config.lerobot_episode_indices()
+    revision = None if policy_aux_config is None else policy_aux_config.lerobot_revision
+    root = None if policy_aux_config is None else policy_aux_config.lerobot_root
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root, revision=revision)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=root,
+        episodes=episodes,
+        revision=revision,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -265,6 +276,7 @@ def create_data_loader(
         seed=config.seed,
         skip_norm_stats=skip_norm_stats,
         framework=framework,
+        policy_aux_config=config.policy_aux,
     )
 
 
@@ -281,6 +293,7 @@ def create_torch_data_loader(
     num_workers: int = 0,
     seed: int = 0,
     framework: str = "jax",
+    policy_aux_config: _policy_aux_dataset.PolicyAuxTrainConfig | None = None,
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create a data loader for training.
 
@@ -299,8 +312,12 @@ def create_torch_data_loader(
             execute in the main process.
         seed: The seed to use for shuffling the data.
     """
-    dataset = create_torch_dataset(data_config, action_horizon, model_config)
+    dataset = create_torch_dataset(data_config, action_horizon, model_config, policy_aux_config=policy_aux_config)
     dataset = transform_dataset(dataset, data_config, skip_norm_stats=skip_norm_stats)
+    if policy_aux_config is not None:
+        if framework != "pytorch":
+            raise ValueError("Policy auxiliary training is implemented only for the PyTorch path")
+        dataset = _policy_aux_dataset.PolicyAuxTransformedDataset(dataset, policy_aux_config)
 
     # Use TorchDataLoader for both frameworks
     # For PyTorch DDP, create DistributedSampler and divide batch size by world size
@@ -424,6 +441,8 @@ class TorchDataLoader:
                 jax.sharding.PartitionSpec("B"),
             )
         self._num_batches = num_batches
+        self._sampler = sampler
+        self._distributed_epoch = 0
 
         mp_context = None
         if num_workers > 0:
@@ -452,6 +471,9 @@ class TorchDataLoader:
     def __iter__(self):
         num_items = 0
         while True:
+            if isinstance(self._sampler, torch.utils.data.distributed.DistributedSampler):
+                self._sampler.set_epoch(self._distributed_epoch)
+                self._distributed_epoch += 1
             data_iter = iter(self._data_loader)
             while True:
                 if self._num_batches is not None and num_items >= self._num_batches:
@@ -537,4 +559,8 @@ class DataLoaderImpl(DataLoader):
 
     def __iter__(self):
         for batch in self._data_loader:
-            yield _model.Observation.from_dict(batch), batch["actions"]
+            observation = _model.Observation.from_dict(batch)
+            if "policy_aux" in batch:
+                yield observation, batch["actions"], batch["policy_aux"]
+            else:
+                yield observation, batch["actions"]
