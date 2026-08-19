@@ -760,8 +760,7 @@ class PI05AuxPolicy(PI0Pytorch):
         suffix, suffix_pad, suffix_ar, adarms_cond = self.embed_suffix(state, x_t, time)
 
         semantic_enabled = (
-            self.aux_config.mode == "ground_geometry_semantic_lm"
-            and not self.aux_config.diagnostic_skip_semantic_lm
+            self.aux_config.mode == "ground_geometry_semantic_lm" and not self.aux_config.diagnostic_skip_semantic_lm
         )
         teacher_input_mask = None
         semantic_anchor_indices = None

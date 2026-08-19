@@ -82,13 +82,9 @@ class PolicyAuxTrainConfig:
             )
         if self.lerobot_root is not None and Path(self.lerobot_root).name != self.lerobot_revision:
             raise ValueError("LeRobot snapshot directory does not match the frozen revision")
-        if (
-            self.lerobot_task_indices is not None
-            and tuple(self.lerobot_task_indices) != LIBERO3_PILOT_TASK_INDICES
-        ):
+        if self.lerobot_task_indices is not None and tuple(self.lerobot_task_indices) != LIBERO3_PILOT_TASK_INDICES:
             raise ValueError(
-                "The only approved reduced pilot population is LeRobot task indices "
-                f"{LIBERO3_PILOT_TASK_INDICES}"
+                "The only approved reduced pilot population is LeRobot task indices " f"{LIBERO3_PILOT_TASK_INDICES}"
             )
 
     def _validated_mapping_records(self) -> list[dict]:
