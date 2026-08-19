@@ -1,5 +1,9 @@
 # LIBERO 三任务 P2：另一台 8×A100 独立训练 Handoff
 
+> **性能配置更新：** 本文件中的旧 BF16-converted base、CUDA allocator 和逐步显存统计设置
+> 已被 `PI05_FP32_CONVERSION_BF16_8GPU_SPEED_HANDOFF_2026-08-19.md` 覆盖。数据、loss、
+> update 数和 exact-resume 规则仍以本文为准。
+
 更新时间：2026-08-19（CEST）
 
 目标机器：单机 8×NVIDIA A100-80GB

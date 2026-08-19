@@ -38,7 +38,13 @@ readonly frozen_num_train_steps=11132
 readonly frozen_warmup_steps=3710
 readonly frozen_ema_decay=0.999
 
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128,expandable_segments:True}
+# The legacy max_split_size/expandable-segments profile produced large periodic
+# reserved-memory swings on 8xA100. train_pytorch.py removes any inherited
+# PYTORCH_CUDA_ALLOC_CONF before CUDA initialization when this flag is enabled.
+export OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=${OPENPI_USE_DEFAULT_CUDA_ALLOCATOR:-1}
+# Per-update torch.cuda.memory_stats() synchronizes the device. Keep it available
+# for diagnostics, but disable it in normal preflight/full launchers.
+export OPENPI_LOG_MEMORY_STATS=${OPENPI_LOG_MEMORY_STATS:-0}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 
 require_positive_integer() {
