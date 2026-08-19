@@ -104,7 +104,7 @@ OPENPI_DATA_HOME=/workspace/vla/models/openpi_jax_cache \
 转换只需执行一次。不要把已有 BF16 safetensors 用 `.float()` 上采样；那不能恢复转换时丢失
 的精度。
 
-已验证 checkpoint：
+源机器上已验证、直接传输时应精确匹配的 checkpoint：
 
 ```text
 model.safetensors bytes: 14,467,165,872
@@ -113,6 +113,37 @@ tensor count: 812
 parameter count: 3,616,757,520
 all tensors: torch.float32
 ```
+
+### 3.1 本地重转换 checksum 与正式运行 provenance
+
+另一台 8×A100 机器按照上面的同一条 JAX→PyTorch 命令重新转换后，得到：
+
+```text
+model.safetensors bytes: 14,467,165,872
+model.safetensors SHA-256: 16d790217b2846abe13d1a2372790c5cd7b2a21a96f94d50ca22190823d2c4ab
+tensor count: 812
+parameter count: 3,616,757,520
+all tensors: torch.float32
+strict auxiliary-base validation: PASS
+```
+
+该 `16d790...` artifact 已完成三任务 P2 的 25+1 preflight，并用于正式实验
+`p2_libero3_fp32base_bf16_full_20260819T165517Z`。正式实验仍为 BF16 finetuning，并非
+full-FP32 training。
+
+两个整文件 SHA 不同的原因已经定位到
+`paligemma_with_expert.gemma_expert.lm_head.weight`。当前转换器从 JAX checkpoint 加载参数时
+不会填充这个 action-expert LM head，因此它保留 PyTorch 模型构造时的随机初始化值。当前 action
+expert 调用内部 `.model.forward`，不调用这个 LM head；它不参与 action forward、loss 或梯度。
+其余 811 个 tensor 在转换为 BF16 后与原已验证官方 BF16 base 逐元素完全一致。
+
+因此 checksum 的使用规则是：
+
+- 从另一台机器传输 artifact 时，必须与源文件记录的 SHA 完全一致；
+- 在目标机器从同一官方 JAX base 本地重转换时，必须记录实际 SHA，并通过下面的严格结构、dtype、
+  tensor 数和参数数验证；不要仅因 unused LM head 造成的整文件 SHA 不同而拒绝 artifact；
+- 每个正式 run 必须在启动清单中记录实际使用的 base SHA，运行中不得替换 base；
+- 除上述已定位的 unused LM head 外，任何参与 forward 的 tensor 差异都不在本说明的允许范围内。
 
 校验：
 
