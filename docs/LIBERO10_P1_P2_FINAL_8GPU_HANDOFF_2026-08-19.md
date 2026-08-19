@@ -1,5 +1,9 @@
 # LIBERO-10 P1/P2 最终 8×A100 Handoff
 
+> **性能配置更新：** base conversion 精度和 trainer 启动环境以
+> `PI05_FP32_CONVERSION_BF16_8GPU_SPEED_HANDOFF_2026-08-19.md` 为准；本文的数据、loss、
+> update 数和 checkpoint 规则保持有效。
+
 更新时间：2026-08-19 UTC
 
 目标机器：单机 8×A100-80GB

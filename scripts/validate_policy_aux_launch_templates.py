@@ -43,7 +43,10 @@ def main() -> None:
             ),
             "data_scaled_training_steps": config.num_train_steps == 11_132,
             "data_scaled_warmup_steps": config.lr_schedule.warmup_steps == 3_710,
-            "official_base_not_libero_checkpoint": config.pytorch_weight_path.endswith("/pi05_base_pytorch"),
+            "official_fp32_converted_base_not_libero_checkpoint": config.pytorch_weight_path.endswith(
+                "/pi05_base_pytorch_fp32"
+            ),
+            "bf16_finetuning_frozen": config.pytorch_training_precision == "bfloat16",
             "canonical_dataset_revision": config.policy_aux.lerobot_root.endswith(
                 "/a4336d589d589045d1c56423ffdf3b88a0e19b1f"
             ),
@@ -91,6 +94,7 @@ def main() -> None:
 
     common_script = repo / "scripts/policy_aux_gpu_common.sh"
     common_text = common_script.read_text()
+    libero3_common_text = (repo / "scripts/policy_aux_libero3_8gpu_common.sh").read_text()
     wrapper_checks = {
         "common_script_executable": common_script.stat().st_mode & 0o111 != 0,
         "requires_exact_profile_gpu_count": "Expected exactly ${gpu_profile} visible CUDA devices" in common_text,
@@ -117,6 +121,17 @@ def main() -> None:
         "full_requires_training_approval": "FULL_TRAINING_APPROVED" in common_text,
         "historical_p0_not_a_launch_guard": "P0_PARITY_APPROVED" not in common_text,
         "preflight_tests_resume": "--resume" in common_text,
+        "default_cuda_allocator_enabled": all(
+            "OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=${OPENPI_USE_DEFAULT_CUDA_ALLOCATOR:-1}" in text
+            for text in (common_text, libero3_common_text)
+        ),
+        "per_update_memory_stats_disabled": all(
+            "OPENPI_LOG_MEMORY_STATS=${OPENPI_LOG_MEMORY_STATS:-0}" in text
+            for text in (common_text, libero3_common_text)
+        ),
+        "legacy_allocator_not_exported": all(
+            "export PYTORCH_CUDA_ALLOC_CONF" not in text for text in (common_text, libero3_common_text)
+        ),
         "no_full_step_or_cadence_override": (
             "NUM_TRAIN_STEPS" not in common_text and "SAVE_INTERVAL" not in common_text
         ),

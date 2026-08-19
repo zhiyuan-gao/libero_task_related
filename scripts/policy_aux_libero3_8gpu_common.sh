@@ -25,7 +25,8 @@ readonly frozen_lambda_geo=0.15
 readonly frozen_lambda_ground=0.50
 readonly frozen_lambda_sem=0.01
 
-export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128,expandable_segments:True}
+export OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=${OPENPI_USE_DEFAULT_CUDA_ALLOCATOR:-1}
+export OPENPI_LOG_MEMORY_STATS=${OPENPI_LOG_MEMORY_STATS:-0}
 export TOKENIZERS_PARALLELISM=${TOKENIZERS_PARALLELISM:-false}
 
 if [[ ! $num_workers =~ ^[0-9]+$ ]]; then

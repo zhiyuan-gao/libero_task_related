@@ -637,7 +637,11 @@ _POLICY_AUX_LEROBOT_ROOT = (
     "datasets--physical-intelligence--libero/snapshots/"
     "a4336d589d589045d1c56423ffdf3b88a0e19b1f"
 )
-_POLICY_AUX_BASE_WEIGHTS = "/workspace/vla/models/openpi/pi05_base_pytorch"
+# Convert the official JAX checkpoint directly to float32 once, then let the
+# PyTorch trainer load it into the configured bfloat16 training model. This
+# preserves the source precision of parameters intentionally kept in float32
+# without paying the memory/runtime cost of full-float32 finetuning.
+_POLICY_AUX_BASE_WEIGHTS = "/workspace/vla/models/openpi/pi05_base_pytorch_fp32"
 _POLICY_AUX_LIBERO_ASSETS = "/workspace/vla/models/openpi/pi05_libero_pytorch/assets"
 
 # Data-scaled official pi0.5 recipe, approved on 2026-08-18. The official

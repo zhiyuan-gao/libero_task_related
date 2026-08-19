@@ -42,12 +42,26 @@ class ExponentialMovingAverage:
     @torch.no_grad()
     def update(self, module: torch.nn.Module) -> None:
         parameters = self._parameters(module)
+        floating_shadows = []
+        floating_parameters = []
+        copied_shadows = []
+        copied_parameters = []
         for name, parameter in parameters.items():
             shadow = self._shadow[name]
             if torch.is_floating_point(shadow) or torch.is_complex(shadow):
-                shadow.mul_(self.decay).add_(parameter.detach(), alpha=1.0 - self.decay)
+                floating_shadows.append(shadow)
+                floating_parameters.append(parameter.detach())
             else:
-                shadow.copy_(parameter.detach())
+                copied_shadows.append(shadow)
+                copied_parameters.append(parameter.detach())
+
+        # Launch batched foreach kernels instead of two kernels per parameter.
+        # This preserves the original update exactly: shadow = decay * shadow + (1 - decay) * parameter.
+        if floating_shadows:
+            torch._foreach_mul_(floating_shadows, self.decay)
+            torch._foreach_add_(floating_shadows, floating_parameters, alpha=1.0 - self.decay)
+        if copied_shadows:
+            torch._foreach_copy_(copied_shadows, copied_parameters)
         self.num_updates += 1
 
     def metadata(self) -> dict:

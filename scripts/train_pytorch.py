@@ -197,29 +197,6 @@ def reduce_scalar_metrics(values: dict[str, float], device: torch.device) -> dic
     return dict(zip(keys, packed.cpu().tolist(), strict=True))
 
 
-def auxiliary_gradient_norms(model: torch.nn.Module) -> dict[str, float]:
-    """Return raw pre-clipping norms for the small P1/P2 parameter groups."""
-
-    module = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    groups = {
-        "geometry_queries": ("geometry_queries",),
-        "geometry_head": ("geometry_head.",),
-        "ground_queries": ("ground_queries",),
-        "ground_head": ("ground_head.",),
-    }
-    squared = dict.fromkeys(groups, 0.0)
-    found = dict.fromkeys(groups, False)
-    for parameter_name, parameter in module.named_parameters():
-        if parameter.grad is None:
-            continue
-        grad_squared = float(parameter.grad.detach().float().square().sum())
-        for group_name, prefixes in groups.items():
-            if parameter_name.startswith(prefixes):
-                squared[group_name] += grad_squared
-                found[group_name] = True
-    return {f"grad_norm_{name}": value**0.5 for name, value in squared.items() if found[name]}
-
-
 def should_save_checkpoint(global_step: int, config: _config.TrainConfig) -> bool:
     return (global_step % config.save_interval == 0 and global_step > 0) or (
         config.save_final_checkpoint and global_step == config.num_train_steps
@@ -527,6 +504,8 @@ def get_latest_checkpoint_step(checkpoint_dir):
 
 def log_memory_usage(device, step, phase="unknown"):
     """Log detailed memory usage information."""
+    if os.environ.get("OPENPI_LOG_MEMORY_STATS", "1").lower() in {"0", "false", "no"}:
+        return
     if not torch.cuda.is_available():
         return
 
@@ -556,7 +535,14 @@ def train_loop(config: _config.TrainConfig):
             "P1/P2 loss coefficients are not approved. Run calibration and explicitly set "
             "policy_aux.loss_coefficients_approved=true before any optimizer step."
         )
-    if int(os.environ.get("WORLD_SIZE", "1")) >= 8:
+    use_default_cuda_allocator = os.environ.get("OPENPI_USE_DEFAULT_CUDA_ALLOCATOR", "0").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    if use_default_cuda_allocator:
+        os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+    elif int(os.environ.get("WORLD_SIZE", "1")) >= 8:
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
@@ -867,10 +853,15 @@ def train_loop(config: _config.TrainConfig):
             if global_step < 5 and is_main and torch.cuda.is_available():
                 log_memory_usage(device, global_step, "after_backward")
 
-            accumulated_auxiliary_values.update(auxiliary_gradient_norms(model))
-
-            # Gradient clipping
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config.optimizer.clip_gradient_norm)
+            # Match the official trainer: clip once and use the returned pre-clipping
+            # global norm for monitoring. Per-parameter auxiliary norm collection
+            # causes a device synchronization for every parameter and does not affect
+            # optimization.
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=config.optimizer.clip_gradient_norm,
+                foreach=True,
+            )
 
             # Optimizer step
             optim.step()

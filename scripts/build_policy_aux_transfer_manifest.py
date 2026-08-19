@@ -96,7 +96,12 @@ def main() -> None:
     root = WORKSPACE / "data/libero_four_suite_annotation/policy_aux_v1"
     items = [
         ("openpi_local_git_bundle", args.openpi_bundle, True, False),
-        ("official_pi05_base_pytorch", WORKSPACE / "models/openpi/pi05_base_pytorch", True, False),
+        (
+            "official_pi05_base_pytorch_fp32_conversion",
+            WORKSPACE / "models/openpi/pi05_base_pytorch_fp32",
+            True,
+            False,
+        ),
         ("libero_normalization_assets", WORKSPACE / "models/openpi/pi05_libero_pytorch/assets", True, False),
         (
             "official_lerobot_libero10_hf_repo_exact_revision",

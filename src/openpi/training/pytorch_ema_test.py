@@ -14,6 +14,14 @@ class _TinyAuxModel(torch.nn.Module):
         self.ground_head = torch.nn.Linear(2, 1)
 
 
+class _MixedDtypeModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.float32 = torch.nn.Parameter(torch.tensor([1.0, 2.0], dtype=torch.float32))
+        self.float64 = torch.nn.Parameter(torch.tensor([3.0, 4.0], dtype=torch.float64))
+        self.frozen_integer = torch.nn.Parameter(torch.tensor([5, 6], dtype=torch.int64), requires_grad=False)
+
+
 def test_ema_initializes_updates_and_covers_auxiliary_parameters() -> None:
     torch.manual_seed(7)
     model = _TinyAuxModel()
@@ -65,3 +73,22 @@ def test_raw_and_ema_checkpoint_roundtrip(tmp_path) -> None:
         for name, parameter in resumed.named_parameters():
             assert torch.equal(parameter, ema_reference[name])
     assert resumed_ema.num_updates == 1
+
+
+def test_ema_foreach_update_matches_scalar_formula_for_mixed_dtypes() -> None:
+    model = _MixedDtypeModel()
+    initial = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    ema = pytorch_ema.ExponentialMovingAverage(model, 0.75)
+
+    with torch.no_grad():
+        model.float32.add_(4.0)
+        model.float64.sub_(2.0)
+        model.frozen_integer.add_(3)
+    raw = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    ema.update(model)
+
+    with ema.average_parameters(model):
+        averaged = dict(model.named_parameters())
+        assert torch.equal(averaged["float32"], initial["float32"] * 0.75 + raw["float32"] * 0.25)
+        assert torch.equal(averaged["float64"], initial["float64"] * 0.75 + raw["float64"] * 0.25)
+        assert torch.equal(averaged["frozen_integer"], raw["frozen_integer"])
