@@ -143,9 +143,20 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    episodes = None if policy_aux_config is None else policy_aux_config.lerobot_episode_indices()
-    revision = None if policy_aux_config is None else policy_aux_config.lerobot_revision
-    root = None if policy_aux_config is None else policy_aux_config.lerobot_root
+    episodes = None if data_config.lerobot_episodes is None else list(data_config.lerobot_episodes)
+    revision = data_config.lerobot_revision
+    root = data_config.lerobot_root
+    if policy_aux_config is not None:
+        aux_episodes = policy_aux_config.lerobot_episode_indices()
+        aux_revision = policy_aux_config.lerobot_revision
+        aux_root = policy_aux_config.lerobot_root
+        if episodes is not None and episodes != aux_episodes:
+            raise ValueError("DataConfig and policy_aux select different LeRobot episodes")
+        if revision is not None and revision != aux_revision:
+            raise ValueError("DataConfig and policy_aux select different LeRobot revisions")
+        if root is not None and root != aux_root:
+            raise ValueError("DataConfig and policy_aux select different LeRobot roots")
+        episodes, revision, root = aux_episodes, aux_revision, aux_root
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root, revision=revision)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
@@ -427,7 +438,10 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
+        # Avoid initializing the JAX/XLA CUDA backend inside PyTorch DDP
+        # processes. Besides being unnecessary, one XLA context per rank can
+        # conflict with rank-local CUDA checkpoint restoration.
+        if framework == "jax" and jax.process_count() > 1:
             raise NotImplementedError("Data loading with multiple processes is not supported.")
 
         if len(dataset) < local_batch_size:
@@ -463,7 +477,10 @@ class TorchDataLoader:
             sampler=sampler,
             num_workers=num_workers,
             multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
+            # Recreate workers at every epoch boundary. Their RNG seeds are
+            # derived from ``generator``, whose epoch-start state is captured
+            # below; this makes replay after an exact resume deterministic.
+            persistent_workers=False,
             collate_fn=_collate_fn,
             worker_init_fn=_worker_init_fn,
             drop_last=True,

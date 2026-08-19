@@ -2,10 +2,12 @@
 
 The disabled mode delegates to :class:`PI0Pytorch` unchanged. Enabled modes add
 explicitly isolated VLM-prefix query groups that are visible to the action expert.
-P2 semantic supervision uses a separate native VLM autoregressive language pass.
-Teacher-forced semantic tokens are never inserted into the action forward. P2 is
-a strict prefix extension of P1: Geometry occupies the first eight auxiliary
-positions, followed by eight Grounding queries.
+P2 semantic supervision retains the native VLM autoregressive language objective.
+Teacher-forced semantic tokens share the production training-time PaliGemma
+transformer forward but are explicitly masked out of the action/Geometry/Ground
+paths. P2 is a strict prefix extension of P1: Geometry occupies the first eight
+auxiliary positions, followed by eight Grounding queries. Inference remains
+teacher-free.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ from openpi.models_pytorch.policy_aux_preprocessing import preprocess_observatio
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 PolicyAuxMode = Literal["none", "geometry", "ground_geometry_semantic_lm"]
+SemanticImplementation = Literal["two_pass_reference", "joint_masked"]
 
 # New branches use independent fixed RNG streams so shared P1/P2 Geometry
 # parameters do not depend on model mode or module-construction order.
@@ -52,6 +55,7 @@ class PolicyAuxConfig:
     lambda_sem: float | None = None
     lambda_ground: float | None = None
     lambda_geo: float | None = None
+    diagnostic_skip_semantic_lm: bool = False
     semantic_annotation_root: str | None = None
     ground_mask_root: str | None = None
     geometry_cache_root: str | None = None
@@ -60,6 +64,8 @@ class PolicyAuxConfig:
     def __post_init__(self) -> None:
         if self.mode not in ("none", "geometry", "ground_geometry_semantic_lm"):
             raise ValueError(f"Unsupported policy_aux_mode: {self.mode}")
+        if self.diagnostic_skip_semantic_lm and self.mode != "ground_geometry_semantic_lm":
+            raise ValueError("The semantic-LM ablation requires the complete P2 mode")
         if self.num_ground_queries != 8 or self.num_geometry_queries != 8:
             raise ValueError("P1/P2 v0 require eight Grounding/Geometry queries")
         if self.geometry_target_dim != 2048:
@@ -91,6 +97,7 @@ def policy_aux_config_from_train_config(train_config) -> PolicyAuxConfig | None:
         lambda_geo=policy_aux.lambda_geo,
         lambda_ground=policy_aux.lambda_ground,
         lambda_sem=policy_aux.lambda_sem,
+        diagnostic_skip_semantic_lm=getattr(policy_aux, "diagnostic_skip_semantic_lm", False),
     )
 
 
@@ -151,6 +158,25 @@ class PrefixLayout:
             )
             if span is not None
         }
+
+
+@dataclasses.dataclass(frozen=True)
+class JointP2TrainLayout:
+    """Ephemeral P2-only layout for the joint masked training computation."""
+
+    base_layout: PrefixLayout
+    semantic: TokenSpan
+    action_suffix: TokenSpan
+
+    def __post_init__(self) -> None:
+        base_end = max(
+            (span.end for span in self.base_layout.query_groups.values()),
+            default=self.base_layout.context.end,
+        )
+        if self.semantic.start != base_end:
+            raise ValueError("Semantic teacher span must immediately follow the base P2 prefix")
+        if self.action_suffix.start != self.semantic.end:
+            raise ValueError("Action suffix must immediately follow the joint PaliGemma-side prefix")
 
 
 @dataclasses.dataclass
@@ -215,6 +241,102 @@ def build_explicit_aux_train_attention(
     )
     full[:, prefix_length:, prefix_length:] = suffix_attention
     return full
+
+
+def build_joint_p2_attention(
+    paligemma_pad_mask: torch.Tensor,
+    suffix_pad_mask: torch.Tensor,
+    suffix_ar_mask: torch.Tensor,
+    layout: JointP2TrainLayout,
+) -> torch.Tensor:
+    """Build the P2 joint mask without exposing SemanticTeacher to Action.
+
+    PaliGemma-side tokens are physically ``Context|Geometry|Ground|Semantic``.
+    The action expert is a separate suffix. Semantic reads Context plus its own
+    causal teacher prefix; Action reads only the base P2 prefix.
+    """
+
+    if paligemma_pad_mask.ndim != 2 or suffix_pad_mask.ndim != 2 or suffix_ar_mask.ndim != 2:
+        raise ValueError("Joint P2 masks must be rank-2")
+    if paligemma_pad_mask.shape[0] != suffix_pad_mask.shape[0]:
+        raise ValueError("Joint P2 prefix/suffix batch sizes differ")
+    if suffix_pad_mask.shape != suffix_ar_mask.shape:
+        raise ValueError("Action suffix pad/AR masks differ")
+
+    batch, paligemma_length = paligemma_pad_mask.shape
+    suffix_length = suffix_pad_mask.shape[1]
+    semantic = layout.semantic
+    action = layout.action_suffix
+    if semantic.end != paligemma_length:
+        raise ValueError("Semantic span must end at the PaliGemma-side sequence boundary")
+    if action.start != paligemma_length or action.end != paligemma_length + suffix_length:
+        raise ValueError("Action suffix span is inconsistent with the joint sequence")
+
+    base_pad = paligemma_pad_mask[:, : semantic.start].to(torch.bool)
+    semantic_pad = paligemma_pad_mask[:, semantic.start : semantic.end].to(torch.bool)
+    base_attention = build_explicit_aux_prefix_attention(base_pad, layout.base_layout)
+    suffix_attention = make_att_2d_masks(suffix_pad_mask, suffix_ar_mask)
+    full = torch.zeros(
+        (batch, action.end, action.end),
+        dtype=torch.bool,
+        device=paligemma_pad_mask.device,
+    )
+    full[:, : semantic.start, : semantic.start] = base_attention
+
+    context = layout.base_layout.context
+    full[:, semantic.start : semantic.end, context.start : context.end] = (
+        semantic_pad[:, :, None] & base_pad[:, None, context.start : context.end]
+    )
+    causal = torch.tril(
+        torch.ones((semantic.length, semantic.length), dtype=torch.bool, device=paligemma_pad_mask.device)
+    )
+    full[:, semantic.start : semantic.end, semantic.start : semantic.end] = (
+        causal[None] & semantic_pad[:, :, None] & semantic_pad[:, None, :]
+    )
+
+    suffix_valid = suffix_pad_mask.to(torch.bool)
+    full[:, action.start : action.end, : semantic.start] = suffix_valid[:, :, None] & base_pad[:, None, :]
+    full[:, action.start : action.end, action.start : action.end] = suffix_attention
+    return full
+
+
+def build_joint_p2_position_ids(
+    base_prefix_pad_mask: torch.Tensor,
+    semantic_pad_mask: torch.Tensor,
+    suffix_pad_mask: torch.Tensor,
+    layout: JointP2TrainLayout,
+) -> torch.Tensor:
+    """Preserve old-main and old-semantic RoPE positions in one sequence."""
+
+    if any(mask.ndim != 2 for mask in (base_prefix_pad_mask, semantic_pad_mask, suffix_pad_mask)):
+        raise ValueError("Joint P2 position masks must be rank-2")
+    batch = base_prefix_pad_mask.shape[0]
+    if semantic_pad_mask.shape[0] != batch or suffix_pad_mask.shape[0] != batch:
+        raise ValueError("Joint P2 position-mask batch sizes differ")
+    if layout.semantic.start != base_prefix_pad_mask.shape[1]:
+        raise ValueError("Joint semantic span does not follow the base prefix")
+    if layout.semantic.length != semantic_pad_mask.shape[1]:
+        raise ValueError("Joint semantic span/mask lengths differ")
+    if layout.action_suffix.length != suffix_pad_mask.shape[1]:
+        raise ValueError("Joint action span/mask lengths differ")
+
+    base_valid = base_prefix_pad_mask.to(torch.bool)
+    semantic_valid = semantic_pad_mask.to(torch.bool)
+    suffix_valid = suffix_pad_mask.to(torch.bool)
+    main_valid = torch.cat((base_valid, suffix_valid), dim=1)
+    main_positions = torch.cumsum(main_valid, dim=1) - 1
+
+    context = layout.base_layout.context
+    if context.start != 0:
+        raise ValueError("Joint P2 Context must begin at zero")
+    semantic_reference_valid = torch.cat((base_valid[:, : context.end], semantic_valid), dim=1)
+    semantic_reference_positions = (torch.cumsum(semantic_reference_valid, dim=1) - 1).clamp_min(0)
+
+    positions = torch.empty((batch, layout.action_suffix.end), dtype=torch.long, device=base_valid.device)
+    positions[:, : layout.semantic.start] = main_positions[:, : layout.semantic.start]
+    positions[:, layout.semantic.start : layout.semantic.end] = semantic_reference_positions[:, context.end :]
+    positions[:, layout.action_suffix.start : layout.action_suffix.end] = main_positions[:, layout.semantic.start :]
+    return positions
 
 
 def build_native_semantic_lm_attention(
@@ -426,17 +548,15 @@ class PI05AuxPolicy(PI0Pytorch):
             language_span,
         )
 
-    def _native_semantic_lm_decode(
-        self,
+    @staticmethod
+    def _validate_semantic_inputs(
         context_embeddings: torch.Tensor,
         context_pad_mask: torch.Tensor,
         language_span: TokenSpan,
         input_ids: torch.Tensor,
         labels: torch.Tensor,
         loss_mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Native autoregressive semantic text objective from image+instruction context."""
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if labels.shape != loss_mask.shape:
             raise ValueError("Semantic label/loss-mask shapes differ")
         if input_ids.ndim != 2 or labels.ndim != 2 or input_ids.shape[0] != labels.shape[0]:
@@ -448,7 +568,6 @@ class PI05AuxPolicy(PI0Pytorch):
         if language_span.end > context_embeddings.shape[1] or language_span.length == 0:
             raise ValueError("Semantic language span is outside the context")
 
-        batch, _ = labels.shape
         language_valid = context_pad_mask[:, language_span.start : language_span.end].to(torch.bool)
         if not bool(language_valid.any(dim=1).all()):
             raise ValueError("Every semantic sample requires at least one valid instruction token")
@@ -461,32 +580,23 @@ class PI05AuxPolicy(PI0Pytorch):
             language_valid, relative_indices, torch.full_like(relative_indices, -1)
         ).amax(dim=1)
         anchor_indices = language_span.start + last_language_offset
+        return loss_mask[:, 1:].to(torch.bool), anchor_indices
 
-        token_embeddings = self._apply_checkpoint(self.paligemma_with_expert.embed_language_tokens, input_ids)
-        token_embeddings = token_embeddings * self.hidden_dim**0.5
-        teacher_input_mask = loss_mask[:, 1:].to(torch.bool)
-        decoder_embeddings = torch.cat((context_embeddings, token_embeddings), dim=1)
-        attention = build_native_semantic_lm_attention(context_pad_mask, teacher_input_mask)
-        valid = torch.cat((context_pad_mask.to(torch.bool), teacher_input_mask), dim=1)
-        position_ids = (torch.cumsum(valid, dim=1) - 1).clamp_min(0)
-        language_model = self.paligemma_with_expert.paligemma.language_model
-        language_model.config._attn_implementation = "eager"  # noqa: SLF001
-        outputs = language_model.forward(
-            inputs_embeds=decoder_embeddings,
-            attention_mask=self._prepare_attention_masks_4d(attention),
-            position_ids=position_ids,
-            past_key_values=None,
-            use_cache=False,
-            adarms_cond=None,
-        ).last_hidden_state
-        batch_indices = torch.arange(batch, device=input_ids.device)
+    def _semantic_lm_objective(
+        self,
+        context_outputs: torch.Tensor,
+        semantic_outputs: torch.Tensor,
+        anchor_indices: torch.Tensor,
+        labels: torch.Tensor,
+        loss_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        batch_indices = torch.arange(labels.shape[0], device=labels.device)
         prediction_states = torch.cat(
-            (
-                outputs[batch_indices, anchor_indices][:, None],
-                outputs[:, context_embeddings.shape[1] :],
-            ),
+            (context_outputs[batch_indices, anchor_indices][:, None], semantic_outputs),
             dim=1,
         )
+        if prediction_states.shape[:2] != labels.shape:
+            raise ValueError("Semantic prediction-state/label shapes differ")
         lm_head = self.paligemma_with_expert.paligemma.lm_head
         logits = lm_head(prediction_states.to(lm_head.weight.dtype)).float()
         per_token = F.cross_entropy(
@@ -511,6 +621,86 @@ class PI05AuxPolicy(PI0Pytorch):
             "logits": logits,
         }
 
+    def _native_semantic_lm_decode(
+        self,
+        context_embeddings: torch.Tensor,
+        context_pad_mask: torch.Tensor,
+        language_span: TokenSpan,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+        loss_mask: torch.Tensor,
+        *,
+        attention_implementation: Literal["eager", "sdpa"] = "sdpa",
+        return_hidden_states: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """Native autoregressive semantic text objective from image+instruction context."""
+
+        batch, _ = labels.shape
+        teacher_input_mask, anchor_indices = self._validate_semantic_inputs(
+            context_embeddings,
+            context_pad_mask,
+            language_span,
+            input_ids,
+            labels,
+            loss_mask,
+        )
+
+        token_embeddings = self._apply_checkpoint(self.paligemma_with_expert.embed_language_tokens, input_ids)
+        token_embeddings = token_embeddings * self.hidden_dim**0.5
+        decoder_embeddings = torch.cat((context_embeddings, token_embeddings), dim=1)
+        attention = build_native_semantic_lm_attention(context_pad_mask, teacher_input_mask)
+        valid = torch.cat((context_pad_mask.to(torch.bool), teacher_input_mask), dim=1)
+        position_ids = (torch.cumsum(valid, dim=1) - 1).clamp_min(0)
+        language_model = self.paligemma_with_expert.paligemma.language_model
+        # The production reference defaults to SDPA: eager attention exceeds an
+        # 80 GB A100 at local batch 32. Validation may explicitly request eager
+        # on a tiny batch to isolate architecture from cross-kernel differences.
+        language_model.config._attn_implementation = attention_implementation  # noqa: SLF001
+        attention_bias = self._prepare_attention_masks_4d(attention).to(decoder_embeddings.dtype)
+
+        def decode_semantic_language_model(
+            embeddings: torch.Tensor,
+            mask: torch.Tensor,
+            positions: torch.Tensor,
+        ) -> torch.Tensor:
+            return language_model.forward(
+                inputs_embeds=embeddings,
+                attention_mask=mask,
+                position_ids=positions,
+                past_key_values=None,
+                use_cache=False,
+                adarms_cond=None,
+            ).last_hidden_state
+
+        # The action/ground/geometry graph is still live at this point.  Outer
+        # checkpoints prevent the additional semantic-LM graph from being
+        # resident at the same time; backward recomputes this pass.  Chunking
+        # only schedules that recomputation and does not change the batch-level
+        # semantic objective below.
+        semantic_activation_chunk_size = 8
+        output_chunks = []
+        for start in range(0, batch, semantic_activation_chunk_size):
+            stop = min(start + semantic_activation_chunk_size, batch)
+            output_chunks.append(
+                self._apply_checkpoint(
+                    decode_semantic_language_model,
+                    decoder_embeddings[start:stop],
+                    attention_bias[start:stop],
+                    position_ids[start:stop],
+                )
+            )
+        outputs = torch.cat(output_chunks, dim=0)
+        result = self._semantic_lm_objective(
+            outputs[:, : context_embeddings.shape[1]],
+            outputs[:, context_embeddings.shape[1] :],
+            anchor_indices,
+            labels,
+            loss_mask,
+        )
+        if return_hidden_states:
+            result["context_hidden_states"] = outputs[:, : context_embeddings.shape[1]]
+        return result
+
     def forward_with_aux(
         self,
         observation,
@@ -519,9 +709,16 @@ class PI05AuxPolicy(PI0Pytorch):
         *,
         noise: torch.Tensor | None = None,
         time: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor | PrefixLayout | dict[str, torch.Tensor]]:
+        semantic_impl: SemanticImplementation = "joint_masked",
+        reference_semantic_attention_impl: Literal["eager", "sdpa"] = "sdpa",
+        return_validation_outputs: bool = False,
+    ) -> dict[str, torch.Tensor | PrefixLayout | JointP2TrainLayout | None | dict[str, torch.Tensor]]:
         if not self.aux_enabled:
             raise RuntimeError("forward_with_aux requires an enabled auxiliary mode")
+        if semantic_impl not in ("two_pass_reference", "joint_masked"):
+            raise ValueError(f"Unsupported semantic implementation: {semantic_impl}")
+        if self.aux_config.mode != "ground_geometry_semantic_lm" and semantic_impl != "joint_masked":
+            raise ValueError("The semantic implementation selector is P2-only")
 
         if self.aux_config.mode == "ground_geometry_semantic_lm":
             if aux_targets.ground_masks is None:
@@ -552,7 +749,7 @@ class PI05AuxPolicy(PI0Pytorch):
         context, context_pad, view_spans, real_views, padded_views, language_span = self._embed_context_with_layout(
             images, image_masks, language_tokens, language_masks
         )
-        prefix, prefix_pad, layout = self._append_aux_queries(
+        base_prefix, base_prefix_pad, layout = self._append_aux_queries(
             context,
             context_pad,
             view_spans=view_spans,
@@ -561,6 +758,60 @@ class PI05AuxPolicy(PI0Pytorch):
             language_span=language_span,
         )
         suffix, suffix_pad, suffix_ar, adarms_cond = self.embed_suffix(state, x_t, time)
+
+        semantic_enabled = (
+            self.aux_config.mode == "ground_geometry_semantic_lm"
+            and not self.aux_config.diagnostic_skip_semantic_lm
+        )
+        teacher_input_mask = None
+        semantic_anchor_indices = None
+        joint_train_layout = None
+        if semantic_enabled:
+            required_semantic = (
+                aux_targets.semantic_input_ids,
+                aux_targets.semantic_labels,
+                aux_targets.semantic_loss_mask,
+            )
+            if any(value is None for value in required_semantic):
+                raise ValueError("Enabled Semantic branch requires teacher-forcing tensors")
+            teacher_input_mask, semantic_anchor_indices = self._validate_semantic_inputs(
+                context,
+                context_pad,
+                language_span,
+                aux_targets.semantic_input_ids,
+                aux_targets.semantic_labels,
+                aux_targets.semantic_loss_mask,
+            )
+
+        if semantic_enabled and semantic_impl == "joint_masked":
+            semantic_embeddings = self._apply_checkpoint(
+                self.paligemma_with_expert.embed_language_tokens,
+                aux_targets.semantic_input_ids,
+            )
+            semantic_embeddings = semantic_embeddings * self.hidden_dim**0.5
+            semantic_span = TokenSpan(base_prefix.shape[1], base_prefix.shape[1] + semantic_embeddings.shape[1])
+            action_span = TokenSpan(semantic_span.end, semantic_span.end + suffix.shape[1])
+            joint_train_layout = JointP2TrainLayout(
+                base_layout=layout,
+                semantic=semantic_span,
+                action_suffix=action_span,
+            )
+            prefix = torch.cat((base_prefix, semantic_embeddings), dim=1)
+            prefix_pad = torch.cat((base_prefix_pad, teacher_input_mask), dim=1)
+            attention = build_joint_p2_attention(prefix_pad, suffix_pad, suffix_ar, joint_train_layout)
+            position_ids = build_joint_p2_position_ids(
+                base_prefix_pad,
+                teacher_input_mask,
+                suffix_pad,
+                joint_train_layout,
+            )
+        else:
+            prefix = base_prefix
+            prefix_pad = base_prefix_pad
+            attention = build_explicit_aux_train_attention(prefix_pad, suffix_pad, suffix_ar, layout)
+            all_pad = torch.cat((prefix_pad, suffix_pad), dim=1)
+            position_ids = torch.cumsum(all_pad, dim=1) - 1
+
         if (
             self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
             == torch.bfloat16
@@ -568,9 +819,6 @@ class PI05AuxPolicy(PI0Pytorch):
             prefix = prefix.to(torch.bfloat16)
             suffix = suffix.to(torch.bfloat16)
 
-        attention = build_explicit_aux_train_attention(prefix_pad, suffix_pad, suffix_ar, layout)
-        all_pad = torch.cat((prefix_pad, suffix_pad), dim=1)
-        position_ids = torch.cumsum(all_pad, dim=1) - 1
         attention_4d = self._prepare_attention_masks_4d(attention)
 
         def joint_forward(prefix, suffix, attention_4d, position_ids, adarms_cond):
@@ -590,6 +838,10 @@ class PI05AuxPolicy(PI0Pytorch):
         action_loss_per_element = F.mse_loss(action_velocity, action_target, reduction="none")
         losses: dict[str, torch.Tensor] = {"action": action_loss_per_element.mean()}
         diagnostics: dict[str, torch.Tensor] = {}
+        if return_validation_outputs:
+            diagnostics["action_velocity"] = action_velocity
+            diagnostics["main_context_hidden_states"] = prefix_output[:, : context.shape[1]]
+            diagnostics["context_pad_mask"] = context_pad
 
         if layout.geometry is not None:
             geometry_states = prefix_output[:, layout.geometry.start : layout.geometry.end]
@@ -678,26 +930,37 @@ class PI05AuxPolicy(PI0Pytorch):
             diagnostics["ground_logits"] = ground_logits
             diagnostics["ground_patch_coverage"] = ground_patch_coverage
 
-        if self.aux_config.mode == "ground_geometry_semantic_lm":
-            required_semantic = (
-                aux_targets.semantic_input_ids,
-                aux_targets.semantic_labels,
-                aux_targets.semantic_loss_mask,
-            )
-            if any(value is None for value in required_semantic):
-                raise ValueError("Enabled Semantic branch requires teacher-forcing tensors")
-            semantic = self._native_semantic_lm_decode(
-                context,
-                context_pad,
-                language_span,
-                aux_targets.semantic_input_ids,
-                aux_targets.semantic_labels,
-                aux_targets.semantic_loss_mask,
-            )
+        if semantic_enabled:
+            if semantic_impl == "joint_masked":
+                semantic = self._semantic_lm_objective(
+                    prefix_output[:, : context.shape[1]],
+                    prefix_output[:, joint_train_layout.semantic.start : joint_train_layout.semantic.end],
+                    semantic_anchor_indices,
+                    aux_targets.semantic_labels,
+                    aux_targets.semantic_loss_mask,
+                )
+            else:
+                semantic = self._native_semantic_lm_decode(
+                    context,
+                    context_pad,
+                    language_span,
+                    aux_targets.semantic_input_ids,
+                    aux_targets.semantic_labels,
+                    aux_targets.semantic_loss_mask,
+                    attention_implementation=reference_semantic_attention_impl,
+                    return_hidden_states=return_validation_outputs,
+                )
             losses["semantic"] = semantic["loss"]
             diagnostics["semantic_token_accuracy"] = semantic["token_accuracy"]
             diagnostics["semantic_teacher_forced_exact_match"] = semantic["teacher_forced_exact_match"]
             diagnostics["semantic_supervised_token_count"] = aux_targets.semantic_loss_mask.to(torch.int64).sum()
+            if return_validation_outputs:
+                diagnostics["semantic_logits"] = semantic["logits"]
+                diagnostics["semantic_context_hidden_states"] = (
+                    prefix_output[:, : context.shape[1]]
+                    if semantic_impl == "joint_masked"
+                    else semantic["context_hidden_states"]
+                )
 
         required_lambdas = {
             "geometry": self.aux_config.lambda_geo,
@@ -716,15 +979,18 @@ class PI05AuxPolicy(PI0Pytorch):
                 diagnostics[f"weighted_{name}_contribution"] = weighted.detach()
                 total = total + weighted
         losses["total"] = total
-        return {
+        result = {
             "losses": losses,
             "diagnostics": diagnostics,
             "layout": dataclasses.replace(
                 layout,
-                action_suffix=TokenSpan(prefix.shape[1], prefix.shape[1] + suffix.shape[1]),
+                action_suffix=TokenSpan(base_prefix.shape[1], base_prefix.shape[1] + suffix.shape[1]),
             ),
             "action_loss_per_element": action_loss_per_element,
         }
+        if joint_train_layout is not None:
+            result["joint_train_layout"] = joint_train_layout
+        return result
 
     def forward(self, observation, actions, aux_targets=None, noise=None, time=None):
         if not self.aux_enabled:

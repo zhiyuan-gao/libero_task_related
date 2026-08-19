@@ -7,10 +7,13 @@ import torch
 from openpi.models_pytorch import preprocessing_pytorch
 from openpi.models_pytorch.auxiliary_heads import grounding_focal_dice_loss
 from openpi.models_pytorch.auxiliary_heads import masked_standardized_mse
+from openpi.models_pytorch.pi05_aux_queries import JointP2TrainLayout
 from openpi.models_pytorch.pi05_aux_queries import PrefixLayout
 from openpi.models_pytorch.pi05_aux_queries import TokenSpan
 from openpi.models_pytorch.pi05_aux_queries import build_explicit_aux_prefix_attention
 from openpi.models_pytorch.pi05_aux_queries import build_explicit_aux_train_attention
+from openpi.models_pytorch.pi05_aux_queries import build_joint_p2_attention
+from openpi.models_pytorch.pi05_aux_queries import build_joint_p2_position_ids
 from openpi.models_pytorch.pi05_aux_queries import build_native_semantic_lm_attention
 from openpi.models_pytorch.pi05_aux_queries import create_pytorch_model
 from openpi.models_pytorch.pi05_aux_queries import load_trained_pytorch_model
@@ -149,6 +152,78 @@ def test_native_semantic_lm_attention_is_separate_prefix_lm() -> None:
     assert bool(mask[:, 3].any()) is False
     assert bool(mask[6].any()) is False
     assert bool(mask[:, 6].any()) is False
+
+
+def _joint_p2_layout() -> JointP2TrainLayout:
+    return JointP2TrainLayout(
+        base_layout=_p2_layout(),
+        semantic=TokenSpan(10, 13),
+        action_suffix=TokenSpan(13, 16),
+    )
+
+
+def test_joint_p2_attention_has_exact_branch_connectivity_and_padding() -> None:
+    layout = _joint_p2_layout()
+    paligemma_pad = torch.tensor([[1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    suffix_ar = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    mask = build_joint_p2_attention(paligemma_pad, suffix_pad, suffix_ar, layout)[0]
+
+    context = slice(0, 6)
+    geometry = slice(6, 8)
+    ground = slice(8, 10)
+    semantic = slice(10, 13)
+    action = slice(13, 16)
+
+    assert bool(mask[context, geometry].any()) is False
+    assert bool(mask[context, ground].any()) is False
+    assert bool(mask[context, semantic].any()) is False
+    assert bool(mask[context, action].any()) is False
+    assert bool(mask[geometry, :5].all()) is True
+    assert bool(mask[geometry, geometry].all()) is True
+    assert bool(mask[geometry, ground].any()) is False
+    assert bool(mask[geometry, semantic].any()) is False
+    assert bool(mask[ground, :5].all()) is True
+    assert bool(mask[ground, ground].all()) is True
+    assert bool(mask[ground, geometry].any()) is False
+    assert bool(mask[ground, semantic].any()) is False
+    assert bool(mask[semantic, geometry].any()) is False
+    assert bool(mask[semantic, ground].any()) is False
+    assert bool(mask[semantic, action].any()) is False
+    assert bool(mask[10, :5].all()) is True
+    assert bool(mask[10, 10]) is True
+    assert bool(mask[10, 11]) is False
+    assert bool(mask[11, 10:12].all()) is True
+    assert bool(mask[action, :5].all()) is True
+    assert bool(mask[action, geometry].all()) is True
+    assert bool(mask[action, ground].all()) is True
+    assert bool(mask[action, semantic].any()) is False
+    assert bool(mask[action, action].all()) is True
+    for padded_index in (5, 12):
+        assert bool(mask[padded_index].any()) is False
+        assert bool(mask[:, padded_index].any()) is False
+
+
+def test_joint_p2_positions_match_old_main_and_semantic_references() -> None:
+    layout = _joint_p2_layout()
+    base_pad = torch.tensor([[1, 1, 1, 1, 1, 0, 1, 1, 1, 1]], dtype=torch.bool)
+    semantic_pad = torch.tensor([[1, 1, 0]], dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    merged = build_joint_p2_position_ids(base_pad, semantic_pad, suffix_pad, layout)
+
+    old_main = torch.cumsum(torch.cat((base_pad, suffix_pad), dim=1), dim=1) - 1
+    old_semantic = (
+        torch.cumsum(torch.cat((base_pad[:, : layout.base_layout.context.end], semantic_pad), dim=1), dim=1) - 1
+    ).clamp_min(0)
+    assert torch.equal(merged[:, : layout.semantic.start], old_main[:, : layout.semantic.start])
+    assert torch.equal(
+        merged[:, layout.semantic.start : layout.semantic.end],
+        old_semantic[:, layout.base_layout.context.end :],
+    )
+    assert torch.equal(
+        merged[:, layout.action_suffix.start : layout.action_suffix.end],
+        old_main[:, layout.semantic.start :],
+    )
 
 
 def test_geometry_invalid_samples_do_not_contribute() -> None:

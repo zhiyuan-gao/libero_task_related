@@ -50,10 +50,15 @@ class PolicyAuxTrainConfig:
     lerobot_revision: str = CANONICAL_LIBERO_REVISION
     lerobot_root: str | None = None
     loss_coefficients_approved: bool = False
+    # Diagnostic-only ablation: retain the complete P2 data/layout/Ground path
+    # while omitting only the native semantic-LM model pass and loss.
+    diagnostic_skip_semantic_lm: bool = False
 
     def __post_init__(self) -> None:
         if self.mode not in ("geometry", "ground_geometry_semantic_lm"):
             raise ValueError(f"Unsupported policy auxiliary training mode: {self.mode}")
+        if self.diagnostic_skip_semantic_lm and self.mode != "ground_geometry_semantic_lm":
+            raise ValueError("The semantic-LM ablation requires the complete P2 mode")
         required_lambdas = ["lambda_geo"]
         if self.mode == "ground_geometry_semantic_lm":
             required_lambdas.extend(("lambda_sem", "lambda_ground"))

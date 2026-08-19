@@ -32,7 +32,7 @@ class Args:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = (
-        "libero_spatial"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
+        "libero_10"  # Task suite. Options: libero_spatial, libero_object, libero_goal, libero_10, libero_90
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
@@ -43,9 +43,33 @@ class Args:
     video_out_path: str = "data/libero/videos"  # Path to save videos
 
     seed: int = 7  # Random Seed (for reproducibility)
+    # Enforce the frozen LIBERO-10 evaluation recipe. Use --no-formal only for
+    # explicitly labelled smoke/debug rollouts.
+    formal: bool = True
+
+
+def _validate_formal_protocol(args: Args) -> None:
+    if not args.formal:
+        return
+    expected = {
+        "task_suite_name": "libero_10",
+        "resize_size": 224,
+        "replan_steps": 5,
+        "num_steps_wait": 10,
+        "num_trials_per_task": 50,
+        "seed": 7,
+    }
+    observed = {name: getattr(args, name) for name in expected}
+    if observed != expected:
+        raise ValueError(
+            "Formal LIBERO evaluation parameters are frozen. "
+            f"expected={expected}, observed={observed}. Use --no-formal only for smoke/debug evaluation."
+        )
 
 
 def eval_libero(args: Args) -> None:
+    _validate_formal_protocol(args)
+
     # Set random seed
     np.random.seed(args.seed)
 
@@ -84,103 +108,114 @@ def eval_libero(args: Args) -> None:
         # Initialize LIBERO environment and task description
         env, task_description = _get_libero_env(task, LIBERO_ENV_RESOLUTION, args.seed)
 
-        # Start episodes
-        task_episodes, task_successes = 0, 0
-        for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
-            logging.info(f"\nTask: {task_description}")
+        try:
+            # Start episodes
+            task_episodes, task_successes = 0, 0
+            for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+                logging.info(f"\nTask: {task_description}")
 
-            # Reset environment
-            env.reset()
-            action_plan = collections.deque()
+                # Reset environment
+                env.reset()
+                action_plan = collections.deque()
 
-            # Set initial states
-            obs = env.set_init_state(initial_states[episode_idx])
+                # Set initial states
+                obs = env.set_init_state(initial_states[episode_idx])
 
-            # Setup
-            t = 0
-            replay_images = []
+                # Setup
+                t = 0
+                done = False
+                replay_images = []
 
-            logging.info(f"Starting episode {task_episodes+1}...")
-            while t < max_steps + args.num_steps_wait:
-                try:
-                    # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
-                    # and we need to wait for them to fall
-                    if t < args.num_steps_wait:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                logging.info(f"Starting episode {task_episodes + 1}...")
+                while t < max_steps + args.num_steps_wait:
+                    try:
+                        # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
+                        # and we need to wait for them to fall
+                        if t < args.num_steps_wait:
+                            obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                            t += 1
+                            continue
+
+                        # Get preprocessed image
+                        # IMPORTANT: rotate 180 degrees to match train preprocessing
+                        img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
+                        wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
+                        img = image_tools.convert_to_uint8(
+                            image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
+                        )
+                        wrist_img = image_tools.convert_to_uint8(
+                            image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
+                        )
+
+                        # Save preprocessed image for replay video
+                        replay_images.append(img)
+
+                        if not action_plan:
+                            # Finished executing previous action chunk -- compute new chunk
+                            # Prepare observations dict
+                            element = {
+                                "observation/image": img,
+                                "observation/wrist_image": wrist_img,
+                                "observation/state": np.concatenate(
+                                    (
+                                        obs["robot0_eef_pos"],
+                                        _quat2axisangle(obs["robot0_eef_quat"]),
+                                        obs["robot0_gripper_qpos"],
+                                    )
+                                ),
+                                "prompt": str(task_description),
+                            }
+
+                            # Query model to get action
+                            action_chunk = client.infer(element)["actions"]
+                            assert len(action_chunk) >= args.replan_steps, (
+                                f"We want to replan every {args.replan_steps} steps, "
+                                f"but policy only predicts {len(action_chunk)} steps."
+                            )
+                            action_plan.extend(action_chunk[: args.replan_steps])
+
+                        action = action_plan.popleft()
+
+                        # Execute action in environment
+                        obs, reward, done, info = env.step(action.tolist())
+                        if done:
+                            task_successes += 1
+                            total_successes += 1
+                            break
                         t += 1
-                        continue
 
-                    # Get preprocessed image
-                    # IMPORTANT: rotate 180 degrees to match train preprocessing
-                    img = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
-                    wrist_img = np.ascontiguousarray(obs["robot0_eye_in_hand_image"][::-1, ::-1])
-                    img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(img, args.resize_size, args.resize_size)
-                    )
-                    wrist_img = image_tools.convert_to_uint8(
-                        image_tools.resize_with_pad(wrist_img, args.resize_size, args.resize_size)
-                    )
-
-                    # Save preprocessed image for replay video
-                    replay_images.append(img)
-
-                    if not action_plan:
-                        # Finished executing previous action chunk -- compute new chunk
-                        # Prepare observations dict
-                        element = {
-                            "observation/image": img,
-                            "observation/wrist_image": wrist_img,
-                            "observation/state": np.concatenate(
-                                (
-                                    obs["robot0_eef_pos"],
-                                    _quat2axisangle(obs["robot0_eef_quat"]),
-                                    obs["robot0_gripper_qpos"],
-                                )
-                            ),
-                            "prompt": str(task_description),
-                        }
-
-                        # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
-                        assert (
-                            len(action_chunk) >= args.replan_steps
-                        ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
-                        action_plan.extend(action_chunk[: args.replan_steps])
-
-                    action = action_plan.popleft()
-
-                    # Execute action in environment
-                    obs, reward, done, info = env.step(action.tolist())
-                    if done:
-                        task_successes += 1
-                        total_successes += 1
+                    except Exception as error:
+                        if args.formal:
+                            raise RuntimeError(
+                                f"Formal evaluation invalidated by task={task_id}, episode={episode_idx}, step={t}"
+                            ) from error
+                        logging.exception("Smoke/debug rollout exception; counting this rollout as a failure")
                         break
-                    t += 1
 
-                except Exception as e:
-                    logging.error(f"Caught exception: {e}")
-                    break
+                task_episodes += 1
+                total_episodes += 1
 
-            task_episodes += 1
-            total_episodes += 1
+                # Save a uniquely named replay instead of overwriting earlier trials.
+                suffix = "success" if done else "failure"
+                task_segment = task_description.replace(" ", "_")
+                if replay_images:
+                    imageio.mimwrite(
+                        pathlib.Path(args.video_out_path)
+                        / f"rollout_task{task_id:02d}_episode{episode_idx:03d}_{task_segment}_{suffix}.mp4",
+                        [np.asarray(x) for x in replay_images],
+                        fps=10,
+                    )
 
-            # Save a replay video of the episode
-            suffix = "success" if done else "failure"
-            task_segment = task_description.replace(" ", "_")
-            imageio.mimwrite(
-                pathlib.Path(args.video_out_path) / f"rollout_{task_segment}_{suffix}.mp4",
-                [np.asarray(x) for x in replay_images],
-                fps=10,
-            )
+                # Log current results
+                logging.info(f"Success: {done}")
+                logging.info(f"# episodes completed so far: {total_episodes}")
+                logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
-            # Log current results
-            logging.info(f"Success: {done}")
-            logging.info(f"# episodes completed so far: {total_episodes}")
-            logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
-
-        # Log final results
-        logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-        logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+            # Log final results
+            logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+            logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+        finally:
+            env.close()
 
     logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")

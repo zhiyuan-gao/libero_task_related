@@ -1,0 +1,171 @@
+from __future__ import annotations
+
+import dataclasses
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from openpi.training import config as _config
+from openpi.training import pytorch_ema
+
+from . import train_pytorch
+
+
+class _ResumeLoader:
+    def __init__(self, token: int):
+        self.token = token
+        self.loaded = None
+
+    def state_dict(self) -> dict:
+        return {"token": self.token}
+
+    def load_state_dict(self, state: dict) -> None:
+        self.loaded = state
+
+
+def _config_for_checkpoint(tmp_path, **changes) -> _config.TrainConfig:
+    config = dataclasses.replace(
+        _config.get_config("debug"),
+        exp_name="ema_roundtrip",
+        checkpoint_base_dir=str(tmp_path),
+        ema_decay=0.9,
+        num_train_steps=3,
+        save_interval=3,
+        keep_period=2,
+        overwrite=False,
+        resume=False,
+        wandb_enabled=False,
+        **changes,
+    )
+    config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    return config
+
+
+def test_trajectory_config_ignores_runtime_controls_but_not_recipe(tmp_path) -> None:
+    base = _config_for_checkpoint(tmp_path)
+    runtime_change = dataclasses.replace(
+        base,
+        num_train_steps=4,
+        save_interval=1000,
+        save_final_checkpoint=False,
+        keep_period=None,
+        log_interval=1,
+        resume=True,
+        wandb_enabled=True,
+    )
+    recipe_change = dataclasses.replace(base, seed=base.seed + 1)
+
+    assert train_pytorch.trajectory_config(runtime_change) == train_pytorch.trajectory_config(base)
+    assert train_pytorch.trajectory_config(recipe_change) != train_pytorch.trajectory_config(base)
+
+
+def test_prune_checkpoints_preserves_periodic_and_latest(tmp_path) -> None:
+    for step in (1000, 2000, 3000, 4000, 5000):
+        (tmp_path / str(step)).mkdir()
+    (tmp_path / "tmp_6000").mkdir()
+    (tmp_path / "notes").mkdir()
+
+    removed = train_pytorch.prune_checkpoints(tmp_path, keep_period=2000)
+
+    assert removed == [1000, 3000]
+    assert {path.name for path in tmp_path.iterdir()} == {"2000", "4000", "5000", "tmp_6000", "notes"}
+
+
+def test_checkpoint_roundtrip_restores_raw_ema_and_allows_runtime_changes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(train_pytorch, "log_memory_usage", lambda *args, **kwargs: None)
+    torch.manual_seed(31)
+    model = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Linear(4, 2))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    ema = pytorch_ema.ExponentialMovingAverage(model, 0.9)
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        model(torch.ones(2, 3)).square().mean().backward()
+        optimizer.step()
+        ema.update(model)
+
+    raw_reference = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    with ema.average_parameters(model):
+        ema_reference = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+
+    config = _config_for_checkpoint(tmp_path)
+    data_config = SimpleNamespace(norm_stats=None, asset_id=None)
+    train_pytorch.save_checkpoint(
+        model,
+        optimizer,
+        3,
+        config,
+        is_main=True,
+        data_config=data_config,
+        data_loader=_ResumeLoader(73),
+        ema=ema,
+        micro_step_in_update=0,
+    )
+    checkpoint = config.checkpoint_dir / "3"
+    assert (checkpoint / "train_model.safetensors").is_file()
+    assert (checkpoint / "model.safetensors").is_file()
+
+    resumed_config = dataclasses.replace(
+        config,
+        num_train_steps=4,
+        save_interval=1000,
+        save_final_checkpoint=False,
+        log_interval=1,
+        keep_period=None,
+        resume=True,
+    )
+    resumed_model = torch.nn.Sequential(torch.nn.Linear(3, 4), torch.nn.Linear(4, 2))
+    resumed_optimizer = torch.optim.AdamW(resumed_model.parameters(), lr=1e-3)
+    resumed_ema = pytorch_ema.ExponentialMovingAverage(resumed_model, 0.9)
+    resumed_loader = _ResumeLoader(999)
+    step = train_pytorch.load_checkpoint(
+        resumed_model,
+        resumed_optimizer,
+        config.checkpoint_dir,
+        torch.device("cpu"),
+        resumed_loader,
+        resumed_config,
+        resumed_ema,
+    )
+
+    assert step == 3
+    assert resumed_ema.num_updates == 3
+    assert resumed_loader.loaded == {"token": 73}
+    for name, parameter in resumed_model.named_parameters():
+        assert torch.equal(parameter, raw_reference[name])
+    with resumed_ema.average_parameters(resumed_model):
+        for name, parameter in resumed_model.named_parameters():
+            assert torch.equal(parameter, ema_reference[name])
+
+
+def test_checkpoint_refuses_trajectory_change_before_loading_weights(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(train_pytorch, "log_memory_usage", lambda *args, **kwargs: None)
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    ema = pytorch_ema.ExponentialMovingAverage(model, 0.9)
+    for _ in range(3):
+        ema.update(model)
+    config = _config_for_checkpoint(tmp_path)
+    train_pytorch.save_checkpoint(
+        model,
+        optimizer,
+        3,
+        config,
+        is_main=True,
+        data_config=SimpleNamespace(norm_stats=None, asset_id=None),
+        data_loader=_ResumeLoader(4),
+        ema=ema,
+        micro_step_in_update=0,
+    )
+    changed = dataclasses.replace(config, seed=config.seed + 1, num_train_steps=4, resume=True)
+
+    with pytest.raises(RuntimeError, match="trajectory-affecting"):
+        train_pytorch.load_checkpoint(
+            torch.nn.Linear(2, 1),
+            torch.optim.AdamW(torch.nn.Linear(2, 1).parameters()),
+            config.checkpoint_dir,
+            torch.device("cpu"),
+            _ResumeLoader(0),
+            changed,
+            pytorch_ema.ExponentialMovingAverage(torch.nn.Linear(2, 1), 0.9),
+        )
