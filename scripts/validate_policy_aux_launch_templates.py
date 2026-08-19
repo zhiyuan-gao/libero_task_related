@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate frozen P1/P2 configs and 8-GPU launch guardrails."""
+"""Validate frozen P1/P2 configs and matching 4/8-GPU launch guardrails."""
 
 from __future__ import annotations
 
@@ -38,11 +38,16 @@ def main() -> None:
                 config.policy_aux.num_ground_queries == 8 and config.policy_aux.num_geometry_queries == 8
             ),
             "effective_batch_256": (config.batch_size * config.gradient_accumulation_steps == 256),
+            "official_8gpu_local_micro_batch_32": (
+                config.batch_size == 256 and config.gradient_accumulation_steps == 1
+            ),
+            "data_scaled_training_steps": config.num_train_steps == 11_132,
+            "data_scaled_warmup_steps": config.lr_schedule.warmup_steps == 3_710,
             "official_base_not_libero_checkpoint": config.pytorch_weight_path.endswith("/pi05_base_pytorch"),
             "canonical_dataset_revision": config.policy_aux.lerobot_root.endswith(
                 "/a4336d589d589045d1c56423ffdf3b88a0e19b1f"
             ),
-            "ema_disabled": config.ema_decay is None,
+            "official_ema_decay": config.ema_decay == 0.999,
         }
         if variant == "p2":
             checks.update(
@@ -66,8 +71,9 @@ def main() -> None:
         "same_effective_batch": (
             p1.batch_size * p1.gradient_accumulation_steps == p2.batch_size * p2.gradient_accumulation_steps == 256
         ),
-        "same_training_steps": p1.num_train_steps == p2.num_train_steps == 30_000,
-        "same_no_ema_policy": p1.ema_decay is None and p2.ema_decay is None,
+        "same_data_scaled_training_steps": p1.num_train_steps == p2.num_train_steps == 11_132,
+        "same_data_scaled_warmup": p1.lr_schedule.warmup_steps == p2.lr_schedule.warmup_steps == 3_710,
+        "same_official_ema_policy": p1.ema_decay == p2.ema_decay == 0.999,
         "same_precision": p1.pytorch_training_precision == p2.pytorch_training_precision,
         "same_seed": p1.seed == p2.seed,
         "same_checkpoint_cadence": (
@@ -83,12 +89,24 @@ def main() -> None:
         ),
     }
 
-    common_script = repo / "scripts/policy_aux_8gpu_common.sh"
+    common_script = repo / "scripts/policy_aux_gpu_common.sh"
     common_text = common_script.read_text()
     wrapper_checks = {
         "common_script_executable": common_script.stat().st_mode & 0o111 != 0,
-        "requires_exact_8_gpus": "Expected exactly 8 visible CUDA devices" in common_text,
-        "requires_effective_batch_match": ("GLOBAL_MICRO_BATCH * GRADIENT_ACCUMULATION_STEPS" in common_text),
+        "requires_exact_profile_gpu_count": "Expected exactly ${gpu_profile} visible CUDA devices" in common_text,
+        "four_gpu_profile_is_local32_accum2": (
+            "profile_global_micro_batch=128" in common_text and "profile_accumulation_steps=2" in common_text
+        ),
+        "eight_gpu_profile_is_local32_accum1": (
+            "profile_global_micro_batch=256" in common_text and "profile_accumulation_steps=1" in common_text
+        ),
+        "requires_local_micro_batch_32": "local/per-GPU micro-batch of 32" in common_text,
+        "requires_effective_batch_256": (
+            "GLOBAL_MICRO_BATCH * GRADIENT_ACCUMULATION_STEPS must equal 256" in common_text
+        ),
+        "frozen_data_scaled_steps": "readonly frozen_num_train_steps=11132" in common_text,
+        "frozen_data_scaled_warmup_documented": "readonly frozen_warmup_steps=3710" in common_text,
+        "frozen_official_ema": "readonly frozen_ema_decay=0.999" in common_text,
         "passes_lambda_approval": "loss-coefficients-approved" in common_text,
         "frozen_lambda_geo": "readonly frozen_lambda_geo=0.15" in common_text,
         "frozen_lambda_ground": "readonly frozen_lambda_ground=0.50" in common_text,
@@ -99,12 +117,18 @@ def main() -> None:
         "full_requires_training_approval": "FULL_TRAINING_APPROVED" in common_text,
         "historical_p0_not_a_launch_guard": "P0_PARITY_APPROVED" not in common_text,
         "preflight_tests_resume": "--resume" in common_text,
+        "no_full_step_or_cadence_override": (
+            "NUM_TRAIN_STEPS" not in common_text and "SAVE_INTERVAL" not in common_text
+        ),
     }
+    for profile in (4, 8):
+        profile_script = repo / f"scripts/policy_aux_{profile}gpu_common.sh"
+        wrapper_checks[f"policy_aux_{profile}gpu_common.sh_executable"] = (
+            profile_script.exists() and profile_script.stat().st_mode & 0o111 != 0
+        )
     for name in (
-        "preflight_p1_libero10_8gpu.sh",
-        "preflight_p2_libero10_8gpu.sh",
-        "launch_p1_libero10_8gpu.sh",
-        "launch_p2_libero10_8gpu.sh",
+        *(f"preflight_{variant}_libero10_{profile}gpu.sh" for profile in (4, 8) for variant in ("p1", "p2")),
+        *(f"launch_{variant}_libero10_{profile}gpu.sh" for profile in (4, 8) for variant in ("p1", "p2")),
     ):
         path = repo / f"scripts/{name}"
         wrapper_checks[f"{name}_executable"] = path.exists() and path.stat().st_mode & 0o111 != 0
@@ -118,14 +142,14 @@ def main() -> None:
         raise RuntimeError(f"Launch-template gate failed: reports={reports}, wrappers={wrapper_checks}")
     payload = {
         "status": "PASS",
-        "gate": "pi05_p1_p2_frozen_8gpu_launch_templates_v2",
+        "gate": "pi05_p1_p2_data_scaled_4gpu_8gpu_launch_templates_v3",
         "development_machine_gpu_count_required": False,
         "preflight_executed": False,
         "reports": reports,
         "p1_p2_fairness_checks": fairness_checks,
         "wrapper_checks": wrapper_checks,
         "known_blockers_before_full_launch": [
-            "8-GPU preflight",
+            "matching 4-GPU or 8-GPU preflight",
             "explicit full-training approval",
         ],
     }

@@ -1,4 +1,5 @@
 import dataclasses
+import math
 
 import jax
 import torch
@@ -16,6 +17,7 @@ def test_torch_data_loader():
         dataset,
         local_batch_size=4,
         num_batches=2,
+        framework="pytorch",
     )
     batches = list(loader)
 
@@ -28,7 +30,7 @@ def test_torch_data_loader_infinite():
     config = pi0_config.Pi0Config(action_dim=24, action_horizon=50, max_token_len=48)
     dataset = _data_loader.FakeDataset(config, 4)
 
-    loader = _data_loader.TorchDataLoader(dataset, local_batch_size=4)
+    loader = _data_loader.TorchDataLoader(dataset, local_batch_size=4, framework="pytorch")
     data_iter = iter(loader)
 
     for _ in range(10):
@@ -54,6 +56,7 @@ def test_distributed_sampler_epoch_advances_when_infinite_loader_restarts():
         local_batch_size=2,
         sampler=sampler,
         num_batches=3,
+        framework="pytorch",
     )
     assert len(list(loader)) == 3
     assert sampler.epochs == [0, 1, 2]
@@ -63,7 +66,13 @@ def test_torch_data_loader_parallel():
     config = pi0_config.Pi0Config(action_dim=24, action_horizon=50, max_token_len=48)
     dataset = _data_loader.FakeDataset(config, 10)
 
-    loader = _data_loader.TorchDataLoader(dataset, local_batch_size=4, num_batches=2, num_workers=2)
+    loader = _data_loader.TorchDataLoader(
+        dataset,
+        local_batch_size=4,
+        num_batches=2,
+        num_workers=2,
+        framework="pytorch",
+    )
     batches = list(loader)
 
     assert len(batches) == 2
@@ -74,6 +83,7 @@ def test_torch_data_loader_parallel():
 
 def test_with_fake_dataset():
     config = _config.get_config("debug")
+    config = dataclasses.replace(config, batch_size=math.lcm(config.batch_size, jax.device_count()))
 
     loader = _data_loader.create_data_loader(config, skip_norm_stats=True, num_batches=2)
     batches = list(loader)
@@ -89,7 +99,7 @@ def test_with_fake_dataset():
 
 def test_with_real_dataset():
     config = _config.get_config("pi0_aloha_sim")
-    config = dataclasses.replace(config, batch_size=4)
+    config = dataclasses.replace(config, batch_size=math.lcm(4, jax.device_count()))
 
     loader = _data_loader.create_data_loader(
         config,

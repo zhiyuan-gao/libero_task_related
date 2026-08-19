@@ -71,6 +71,13 @@ class DataConfig:
     # Contains precomputed normalization stats. If None, normalization will not be performed.
     norm_stats: dict[str, _transforms.NormStats] | None = None
 
+    # Optional deterministic LeRobot population selection. Keeping this separate
+    # from policy_aux lets an auxiliary-disabled baseline use the exact same
+    # local dataset revision and episodes as P1/P2.
+    lerobot_root: str | None = None
+    lerobot_revision: str | None = None
+    lerobot_episodes: Sequence[int] | None = None
+
     # Used to adopt the inputs from a dataset specific format to a common format
     # which is expected by the data transforms.
     repack_transforms: _transforms.Group = dataclasses.field(default_factory=_transforms.Group)
@@ -569,12 +576,14 @@ class TrainConfig:
                 "lambda_geo": 0.15,
                 "lambda_ground": None,
                 "lambda_sem": None,
+                "diagnostic_skip_semantic_lm": False,
             },
             "pi05_libero_p2_aux": {
                 "mode": "ground_geometry_semantic_lm",
                 "lambda_geo": 0.15,
                 "lambda_ground": 0.50,
                 "lambda_sem": 0.01,
+                "diagnostic_skip_semantic_lm": False,
             },
         }
         if expected := frozen_policy_aux.get(self.name):
@@ -585,15 +594,22 @@ class TrainConfig:
                 "lambda_geo": self.policy_aux.lambda_geo,
                 "lambda_ground": self.policy_aux.lambda_ground,
                 "lambda_sem": self.policy_aux.lambda_sem,
+                "diagnostic_skip_semantic_lm": self.policy_aux.diagnostic_skip_semantic_lm,
             }
             if observed != expected:
                 raise ValueError(
                     f"{self.name} auxiliary architecture/lambdas are frozen: expected={expected}, observed={observed}"
                 )
+        diagnostic_name = "pi05_libero_p2_ground_only_diagnostic"
+        if self.policy_aux is not None and self.policy_aux.diagnostic_skip_semantic_lm:
+            if self.name != diagnostic_name:
+                raise ValueError("Skipping the semantic LM is allowed only in the isolated diagnostic config")
+        elif self.name == diagnostic_name:
+            raise ValueError(f"{diagnostic_name} must skip the semantic LM")
 
 
 # P1/P2 development paths are explicit so that the transfer manifest can rewrite
-# them mechanically on the 8-GPU target. The primary coefficients were frozen by
+# them mechanically on the 4/8-GPU target. The primary coefficients were frozen by
 # human approval on 2026-08-18 and remain identical wherever a loss is shared.
 _POLICY_AUX_ROOT = "/workspace/vla/data/libero_four_suite_annotation/policy_aux_v1"
 _POLICY_AUX_LEROBOT_ROOT = (
@@ -603,6 +619,13 @@ _POLICY_AUX_LEROBOT_ROOT = (
 )
 _POLICY_AUX_BASE_WEIGHTS = "/workspace/vla/models/openpi/pi05_base_pytorch"
 _POLICY_AUX_LIBERO_ASSETS = "/workspace/vla/models/openpi/pi05_libero_pytorch/assets"
+
+# Data-scaled official pi0.5 recipe, approved on 2026-08-18. The official
+# four-suite population contains 273,465 frames; the frozen LIBERO-10 subset
+# contains 101,469. Scaling 30,000 updates and 10,000 warmup updates by this
+# frame ratio gives 11,131.48 and 3,710.49 respectively.
+_POLICY_AUX_NUM_TRAIN_STEPS = 11_132
+_POLICY_AUX_WARMUP_STEPS = 3_710
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -810,6 +833,40 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    # Auxiliary-disabled pi0.5 baseline on the exact frozen LIBERO-10 policy
+    # population. Model and action objective remain the official pi05_libero
+    # implementation; only hardware/data-volume adaptations match P1/P2.
+    TrainConfig(
+        name="pi05_libero10_baseline",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+                lerobot_revision=_policy_aux_dataset.CANONICAL_LIBERO_REVISION,
+                lerobot_episodes=tuple(range(_policy_aux_dataset.CANONICAL_LIBERO_EPISODES)),
+            ),
+            extra_delta_transform=False,
+        ),
+        # Official 8-GPU profile: local micro-batch 32, accumulation 1.
+        # The 4-GPU benchmark launcher overrides these to 128 and 2.
+        batch_size=256,
+        gradient_accumulation_steps=1,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=_POLICY_AUX_WARMUP_STEPS,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/checkpoints/openpi_baseline_benchmark",
+        num_train_steps=_POLICY_AUX_NUM_TRAIN_STEPS,
+    ),
     TrainConfig(
         name="pi05_libero_p1_aux",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
@@ -829,23 +886,22 @@ _CONFIGS = [
             lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
             loss_coefficients_approved=True,
         ),
-        batch_size=8,
-        gradient_accumulation_steps=32,
+        # Official 8-GPU profile: local micro-batch 32, accumulation 1.
+        # The 4-GPU launcher overrides only these two fields to 128 and 2.
+        batch_size=256,
+        gradient_accumulation_steps=1,
         num_workers=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=_POLICY_AUX_WARMUP_STEPS,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        # P1/P2 use the PyTorch trainer's simplest native behavior: no EMA.
-        # Keep this identical between P1 and P2; historical P0 parity is not a
-        # launch prerequisite for the current architecture-validation stage.
-        ema_decay=None,
+        ema_decay=0.999,
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
-        num_train_steps=30_000,
+        num_train_steps=_POLICY_AUX_NUM_TRAIN_STEPS,
     ),
     TrainConfig(
         name="pi05_libero_p2_aux",
@@ -868,21 +924,62 @@ _CONFIGS = [
             lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
             loss_coefficients_approved=True,
         ),
-        batch_size=8,
-        gradient_accumulation_steps=32,
+        # Official 8-GPU profile: local micro-batch 32, accumulation 1.
+        # The 4-GPU launcher overrides only these two fields to 128 and 2.
+        batch_size=256,
+        gradient_accumulation_steps=1,
         num_workers=8,
         lr_schedule=_optimizer.CosineDecaySchedule(
-            warmup_steps=10_000,
+            warmup_steps=_POLICY_AUX_WARMUP_STEPS,
             peak_lr=5e-5,
             decay_steps=1_000_000,
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        # Frozen P1/P2 protocol: no EMA (identical to P1).
-        ema_decay=None,
+        ema_decay=0.999,
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
-        num_train_steps=30_000,
+        num_train_steps=_POLICY_AUX_NUM_TRAIN_STEPS,
+    ),
+    # Diagnostic-only P2 ablation. It intentionally preserves the complete P2
+    # query layout, Ground preprocessing/head/loss, semantic target loading,
+    # optimizer, and batch semantics while skipping only the semantic LM pass.
+    TrainConfig(
+        name="pi05_libero_p2_ground_only_diagnostic",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        policy_aux=_policy_aux_dataset.PolicyAuxTrainConfig(
+            mode="ground_geometry_semantic_lm",
+            policy_manifest_path=f"{_POLICY_AUX_ROOT}/manifests/libero10_policy_aux_manifest.parquet",
+            episode_mapping_path=f"{_POLICY_AUX_ROOT}/debug/lerobot_episode_mapping.json",
+            geometry_target_index_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/target_index.parquet",
+            geometry_normalization_path=(f"{_POLICY_AUX_ROOT}/geometry_libero10/normalization/train_mean_std.json"),
+            lambda_sem=0.01,
+            lambda_ground=0.50,
+            lambda_geo=0.15,
+            lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+            loss_coefficients_approved=True,
+            diagnostic_skip_semantic_lm=True,
+        ),
+        batch_size=256,
+        gradient_accumulation_steps=1,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=_POLICY_AUX_WARMUP_STEPS,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/checkpoints/openpi_diagnostic_benchmarks",
+        num_train_steps=_POLICY_AUX_NUM_TRAIN_STEPS,
     ),
     #
     # Fine-tuning Aloha configs.

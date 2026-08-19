@@ -29,6 +29,7 @@ import gc
 import logging
 import os
 import platform
+import random
 import shutil
 import time
 
@@ -46,7 +47,10 @@ import openpi.models_pytorch.pi05_aux_queries as _pi05_aux
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+import openpi.training.pytorch_ema as _pytorch_ema
 import openpi.training.pytorch_resume as _pytorch_resume
+
+_OBJECT_PROCESS_GROUP: dist.ProcessGroup | None = None
 
 
 def init_logging():
@@ -94,34 +98,51 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 
 
 def setup_ddp():
+    global _OBJECT_PROCESS_GROUP  # noqa: PLW0603
+
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        torch.distributed.init_process_group(
+            backend=backend,
+            init_method="env://",
+            device_id=device if backend == "nccl" else None,
+        )
+        # Object collectives pickle CPU-side RNG/data-loader state. PyTorch's
+        # NCCL object path materializes its internal tensors on cuda:0, which
+        # conflicts with rank-local device binding. Keep model collectives on
+        # NCCL and serialize checkpoint metadata over an explicit CPU group.
+        _OBJECT_PROCESS_GROUP = dist.new_group(backend="gloo")
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
     return use_ddp, local_rank, device
 
 
 def cleanup_ddp():
+    global _OBJECT_PROCESS_GROUP  # noqa: PLW0603
+
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
+        if _OBJECT_PROCESS_GROUP is not None:
+            torch.distributed.destroy_process_group(_OBJECT_PROCESS_GROUP)
+            _OBJECT_PROCESS_GROUP = None
         torch.distributed.destroy_process_group()
 
 
-def set_seed(seed: int, local_rank: int):
-    torch.manual_seed(seed + local_rank)
-    np.random.seed(seed + local_rank)
+def set_seed(seed: int, rank: int):
+    torch.manual_seed(seed + rank)
+    np.random.seed(seed + rank)
+    random.seed(seed + rank)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed + local_rank)
+        torch.cuda.manual_seed_all(seed + rank)
 
 
 def build_datasets(config: _config.TrainConfig):
@@ -205,6 +226,43 @@ def should_save_checkpoint(global_step: int, config: _config.TrainConfig) -> boo
     )
 
 
+_RESUME_RUNTIME_FIELDS = {
+    "keep_period",
+    "log_interval",
+    "num_train_steps",
+    "overwrite",
+    "resume",
+    "save_final_checkpoint",
+    "save_interval",
+    "wandb_enabled",
+}
+
+
+def trajectory_config(config: _config.TrainConfig | dict) -> dict:
+    """Return only fields that can affect the optimizer/data trajectory."""
+
+    payload = dataclasses.asdict(config) if dataclasses.is_dataclass(config) else dict(config)
+    return {key: value for key, value in payload.items() if key not in _RESUME_RUNTIME_FIELDS}
+
+
+def prune_checkpoints(checkpoint_dir, *, keep_period: int | None) -> list[int]:
+    """Keep protected periodic checkpoints and at most the latest ordinary checkpoint."""
+
+    checkpoints = sorted(
+        (int(path.name), path) for path in checkpoint_dir.iterdir() if path.is_dir() and path.name.isdigit()
+    )
+    if not checkpoints:
+        return []
+    latest_step = checkpoints[-1][0]
+    removed = []
+    for step, path in checkpoints:
+        protected = keep_period is not None and step % keep_period == 0
+        if step != latest_step and not protected:
+            shutil.rmtree(path)
+            removed.append(step)
+    return removed
+
+
 def save_checkpoint(
     model,
     optimizer,
@@ -213,12 +271,21 @@ def save_checkpoint(
     is_main,
     data_config,
     data_loader,
+    ema,
     *,
     micro_step_in_update: int,
 ):
     """Save model/optimizer plus per-rank exact-continuation state."""
     if not should_save_checkpoint(global_step, config):
         return
+
+    model_for_device = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    parameter_device = next(model_for_device.parameters()).device
+    if parameter_device.type == "cuda" and torch.cuda.current_device() != parameter_device.index:
+        raise RuntimeError(
+            "Refusing to save non-exact CUDA RNG state: "
+            f"model device={parameter_device.index}, current device={torch.cuda.current_device()}"
+        )
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_initialized() else 1
@@ -229,8 +296,10 @@ def save_checkpoint(
         world_size=world_size,
     )
     if dist.is_initialized():
+        if _OBJECT_PROCESS_GROUP is None:
+            raise RuntimeError("DDP checkpointing requires the CPU object process group")
         rank_states = [None] * world_size if is_main else None
-        dist.gather_object(local_training_state, rank_states, dst=0)
+        dist.gather_object(local_training_state, rank_states, dst=0, group=_OBJECT_PROCESS_GROUP)
     else:
         rank_states = [local_training_state]
     if not is_main:
@@ -248,9 +317,14 @@ def save_checkpoint(
         shutil.rmtree(tmp_ckpt_dir)
     tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save model state using safetensors (handle shared tensors)
+    # Save raw optimizer-updated weights for exact continuation and EMA weights
+    # under the standard serving filename.
     model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-    safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+    if ema is None:
+        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+    else:
+        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "train_model.safetensors")
+        ema.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
 
     # Save optimizer state using PyTorch format
     torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -262,6 +336,8 @@ def save_checkpoint(
         "timestamp": time.time(),
         "resume_semantics": "EXACT_CONTINUATION",
         "gradient_accumulation_boundary": micro_step_in_update,
+        "checkpoint_schema": "openpi.pytorch_raw_ema_checkpoint.v2",
+        "ema": None if ema is None else ema.metadata(),
     }
     torch.save(metadata, tmp_ckpt_dir / "metadata.pt")
     torch.save(
@@ -278,10 +354,14 @@ def save_checkpoint(
     if norm_stats is not None and data_config.asset_id is not None:
         _normalize.save(tmp_ckpt_dir / "assets" / data_config.asset_id, norm_stats)
 
-    # Atomically move temp directory to final location
+    # Atomically publish only after every required file is complete.
     if final_ckpt_dir.exists():
-        shutil.rmtree(final_ckpt_dir)
+        raise FileExistsError(f"Refusing to replace an already-published checkpoint: {final_ckpt_dir}")
     tmp_ckpt_dir.rename(final_ckpt_dir)
+
+    removed = prune_checkpoints(config.checkpoint_dir, keep_period=config.keep_period)
+    if removed:
+        logging.info(f"Pruned superseded ordinary checkpoints: {removed}")
 
     logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
@@ -290,7 +370,7 @@ def save_checkpoint(
         wandb.log({"checkpoint_step": global_step}, step=global_step)
 
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, config):
+def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, config, ema):
     """Load the latest checkpoint and restore exact per-rank continuation state."""
     checkpoint_steps = [
         int(d.name)
@@ -304,6 +384,41 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, confi
     latest_step = max(checkpoint_steps)
     ckpt_dir = checkpoint_dir / f"{latest_step}"
 
+    metadata_path = ckpt_dir / "metadata.pt"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Checkpoint metadata is missing: {metadata_path}")
+    metadata = torch.load(metadata_path, map_location="cpu", weights_only=False)
+    global_step = int(metadata.get("global_step", latest_step))
+    if global_step != latest_step:
+        raise RuntimeError(
+            f"Checkpoint directory/metadata step mismatch: directory={latest_step}, metadata={global_step}"
+        )
+    if metadata.get("resume_semantics") != "EXACT_CONTINUATION":
+        raise RuntimeError(
+            "Checkpoint predates exact-continuation state. Resume is intentionally refused instead of "
+            "silently restarting the data stream."
+        )
+    saved_config = metadata.get("config")
+    if saved_config is None:
+        raise RuntimeError("Exact-resume checkpoint is missing its training config")
+    if trajectory_config(saved_config) != trajectory_config(config):
+        raise RuntimeError("Exact resume requires the original trajectory-affecting training config")
+    if config.num_train_steps < global_step:
+        raise RuntimeError(
+            f"Resume target num_train_steps={config.num_train_steps} is behind checkpoint step {global_step}"
+        )
+    saved_ema_metadata = metadata.get("ema")
+    if ema is None and saved_ema_metadata is not None:
+        raise RuntimeError("Checkpoint contains EMA state but the current config disables EMA")
+    if ema is not None:
+        if saved_ema_metadata is None:
+            raise RuntimeError("EMA-enabled exact resume requires saved EMA metadata")
+        if int(saved_ema_metadata.get("num_updates", -1)) != global_step:
+            raise RuntimeError(
+                f"EMA update count must equal optimizer step: ema={saved_ema_metadata.get('num_updates')}, "
+                f"step={global_step}"
+            )
+
     # Clear memory before loading checkpoints
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -313,7 +428,7 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, confi
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / "model.safetensors"
+        safetensors_path = ckpt_dir / ("train_model.safetensors" if ema is not None else "model.safetensors")
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
@@ -331,8 +446,12 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, confi
         optimizer_path = ckpt_dir / "optimizer.pt"
 
         if optimizer_path.exists():
-            optimizer_state_dict = torch.load(optimizer_path, map_location=device, weights_only=False)
-            logging.info("Loaded optimizer state from pt format")
+            # Deserialize large optimizer tensors into host memory first.
+            # optimizer.load_state_dict then casts/moves each state tensor to
+            # its parameter's rank-local device without stressing CUDA's
+            # serialization path from four concurrent readers.
+            optimizer_state_dict = torch.load(optimizer_path, map_location="cpu", weights_only=False)
+            logging.info("Loaded optimizer state from pt format into host memory")
         else:
             raise FileNotFoundError(f"No optimizer checkpoint found at {ckpt_dir}")
 
@@ -342,25 +461,16 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, confi
         gc.collect()
         log_memory_usage(device, latest_step, "after_loading_optimizer")
 
-        # Load metadata
-        logging.info("Loading metadata...")
-        metadata = torch.load(ckpt_dir / "metadata.pt", map_location="cpu", weights_only=False)
-        global_step = metadata.get("global_step", latest_step)
-        if metadata.get("resume_semantics") != "EXACT_CONTINUATION":
-            raise RuntimeError(
-                "Checkpoint predates exact-continuation state. Resume is intentionally refused instead of "
-                "silently restarting the data stream."
-            )
-        saved_config = metadata.get("config")
-        current_config = dataclasses.asdict(config)
-        if saved_config is None:
-            raise RuntimeError("Exact-resume checkpoint is missing its training config")
-        # These flags control entry into the resume path, not the trajectory.
-        for runtime_flag in ("resume", "overwrite"):
-            saved_config[runtime_flag] = False
-            current_config[runtime_flag] = False
-        if saved_config != current_config:
-            raise RuntimeError("Exact resume requires the original training config")
+        if ema is not None:
+            logging.info("Loading EMA inference parameters...")
+            ema_path = ckpt_dir / "model.safetensors"
+            if not ema_path.exists():
+                raise FileNotFoundError(f"EMA inference parameters are missing: {ema_path}")
+            model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+            ema.load_model(model_to_load, ema_path, device=str(device))
+            ema.load_metadata(saved_ema_metadata, model_to_load)
+            logging.info(f"Restored EMA parameters at update {ema.num_updates}")
+
         del metadata
         torch.cuda.empty_cache()
         gc.collect()
@@ -450,7 +560,8 @@ def train_loop(config: _config.TrainConfig):
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,expandable_segments:True")
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
-    set_seed(config.seed, local_rank)
+    rank = dist.get_rank() if use_ddp else 0
+    set_seed(config.seed, rank)
 
     # Initialize checkpoint directory and wandb
     resuming = False
@@ -469,16 +580,26 @@ def train_loop(config: _config.TrainConfig):
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
-        shutil.rmtree(config.checkpoint_dir)
-        logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+    elif config.overwrite:
+        if is_main and config.checkpoint_dir.exists():
+            shutil.rmtree(config.checkpoint_dir)
+            logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
+    elif config.checkpoint_dir.exists():
+        raise FileExistsError(
+            f"Checkpoint directory {config.checkpoint_dir} already exists. Use --overwrite or --resume."
+        )
 
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
     else:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
@@ -597,6 +718,17 @@ def train_loop(config: _config.TrainConfig):
             safetensors.torch.load_model(model_to_load, model_path, strict=True)
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
+    model_for_state = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+    ema = (
+        None
+        if config.ema_decay is None
+        else _pytorch_ema.ExponentialMovingAverage(model_for_state, decay=config.ema_decay)
+    )
+    if ema is not None:
+        logging.info(
+            f"Initialized EMA after base checkpoint load: decay={ema.decay}, parameters={len(ema.metadata()['parameter_names'])}"
+        )
+
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
     peak_lr = config.lr_schedule.peak_lr
@@ -615,7 +747,7 @@ def train_loop(config: _config.TrainConfig):
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, loader, config)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, loader, config, ema)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -651,7 +783,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
-        logging.info("EMA is not supported for PyTorch training")
+        logging.info("EMA: disabled" if ema is None else f"EMA: decay={ema.decay}, update once per optimizer update")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
     # Training loop - iterate until we reach num_train_steps
@@ -742,6 +874,12 @@ def train_loop(config: _config.TrainConfig):
 
             # Optimizer step
             optim.step()
+            if ema is not None:
+                ema.update(model_for_state)
+                if ema.num_updates != global_step + 1:
+                    raise RuntimeError(
+                        f"EMA/optimizer update mismatch: ema={ema.num_updates}, expected={global_step + 1}"
+                    )
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
@@ -755,6 +893,7 @@ def train_loop(config: _config.TrainConfig):
                 {
                     "loss": update_loss,
                     "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
+                    **({"ema_updates": float(ema.num_updates)} if ema is not None else {}),
                     **accumulated_auxiliary_values,
                 },
                 device,
@@ -837,6 +976,7 @@ def train_loop(config: _config.TrainConfig):
                 is_main,
                 data_config,
                 loader,
+                ema,
                 micro_step_in_update=micro_step_in_update,
             )
             if use_ddp and should_save_checkpoint(global_step, config):
