@@ -28,12 +28,10 @@ DEFAULT_MAPPING = Path(
     "/workspace/vla/data/libero_four_suite_annotation/policy_aux_v1/debug/lerobot_episode_mapping.json"
 )
 DEFAULT_MANIFEST = Path(
-    "/workspace/vla/data/libero_four_suite_annotation/policy_aux_v1/manifests/"
-    "libero10_policy_aux_manifest.parquet"
+    "/workspace/vla/data/libero_four_suite_annotation/policy_aux_v1/manifests/" "libero10_policy_aux_manifest.parquet"
 )
 DEFAULT_OUTPUT = Path(
-    "/workspace/vla/data/libero_four_suite_annotation/policy_aux_v1/unit_gates/"
-    "joint_p2_semantic_abc_gate.json"
+    "/workspace/vla/data/libero_four_suite_annotation/policy_aux_v1/unit_gates/" "joint_p2_semantic_abc_gate.json"
 )
 
 
@@ -108,9 +106,7 @@ def fixed_forward(
 
 def selected_parameters(model: PI05AuxPolicy) -> dict[str, torch.nn.Parameter]:
     exact_names = {
-        "paligemma_backbone": (
-            "paligemma_with_expert.paligemma.model.language_model.layers.0.self_attn.q_proj.weight"
-        ),
+        "paligemma_backbone": ("paligemma_with_expert.paligemma.model.language_model.layers.0.self_attn.q_proj.weight"),
         "action_expert": "paligemma_with_expert.gemma_expert.model.layers.0.self_attn.q_proj.weight",
         "geometry_query": "geometry_queries",
         "geometry_head": "geometry_head.output_projection.weight",
@@ -180,9 +176,7 @@ def main() -> None:
 
     torch.cuda.reset_peak_memory_stats(device)
     with torch.no_grad():
-        reference = fixed_forward(
-            model, observation, actions, targets, noise, diffusion_time, "two_pass_reference"
-        )
+        reference = fixed_forward(model, observation, actions, targets, noise, diffusion_time, "two_pass_reference")
         joint = fixed_forward(model, observation, actions, targets, noise, diffusion_time, "joint_masked")
 
     forward_tensors = {
@@ -217,9 +211,7 @@ def main() -> None:
             relative_tolerance, absolute_tolerance = 2.5e-3, 1e-3
         else:
             relative_tolerance, absolute_tolerance = 5e-4, 1e-3
-        forward_checks[name] = (
-            metrics["relative_l2"] <= relative_tolerance and metrics["max_abs"] <= absolute_tolerance
-        )
+        forward_checks[name] = metrics["relative_l2"] <= relative_tolerance and metrics["max_abs"] <= absolute_tolerance
     valid_context = reference["diagnostics"]["context_pad_mask"].to(torch.bool)
     context_hidden_state_metrics = {
         "old_main_vs_old_semantic": tensor_metrics(
@@ -265,9 +257,7 @@ def main() -> None:
         "ground_unchanged": no_leakage_metrics["ground_output"]["max_abs"] <= 1e-7,
         "semantic_logits_changed": no_leakage_metrics["semantic_logits"]["relative_l2"] > 1e-5,
         "semantic_loss_changed": no_leakage_metrics["semantic_loss_abs_change"] > 1e-6,
-        "physical_length_unchanged": (
-            targets.semantic_input_ids.shape == changed_targets.semantic_input_ids.shape
-        ),
+        "physical_length_unchanged": (targets.semantic_input_ids.shape == changed_targets.semantic_input_ids.shape),
         "padding_and_loss_mask_unchanged": torch.equal(
             targets.semantic_loss_mask,
             changed_targets.semantic_loss_mask,
@@ -315,9 +305,7 @@ def main() -> None:
     joint_grad_result["losses"]["total"].backward()
     joint_layout_present = joint_grad_result["joint_train_layout"] is not None
     joint_gradients = capture_selected_gradients(parameters)
-    gradient_metrics = {
-        name: tensor_metrics(reference_gradients[name], joint_gradients[name]) for name in parameters
-    }
+    gradient_metrics = {name: tensor_metrics(reference_gradients[name], joint_gradients[name]) for name in parameters}
     gradient_checks = {
         name: metrics.get("cosine", -1.0) >= 0.999
         and metrics["relative_l2"] <= 5e-3
@@ -342,9 +330,7 @@ def main() -> None:
             "two_pass_reference",
             reference_attention_impl="sdpa",
         )
-        production_joint = fixed_forward(
-            model, observation, actions, targets, noise, diffusion_time, "joint_masked"
-        )
+        production_joint = fixed_forward(model, observation, actions, targets, noise, diffusion_time, "joint_masked")
     production_tensors = {
         "action_output": (
             production_reference["diagnostics"]["action_velocity"],
