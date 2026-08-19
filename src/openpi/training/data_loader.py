@@ -64,6 +64,24 @@ class TransformedDataset(Dataset[T_co]):
         return len(self._dataset)
 
 
+class IndexedSubsetDataset(Dataset[T_co]):
+    """Read an immutable subset while preserving the base dataset's episode index table."""
+
+    def __init__(self, dataset: Dataset[T_co], indices: Sequence[int]):
+        self._dataset = dataset
+        self._indices = tuple(int(index) for index in indices)
+        if not self._indices or len(set(self._indices)) != len(self._indices):
+            raise ValueError("Subset indices must be non-empty and unique")
+        if min(self._indices) < 0 or max(self._indices) >= len(dataset):
+            raise IndexError("Subset index is outside the base dataset")
+
+    def __getitem__(self, index: SupportsIndex) -> T_co:
+        return self._dataset[self._indices[index.__index__()]]
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+
 class IterableTransformedDataset(IterableDataset[T_co]):
     def __init__(
         self,
@@ -146,6 +164,7 @@ def create_torch_dataset(
     episodes = None if data_config.lerobot_episodes is None else list(data_config.lerobot_episodes)
     revision = data_config.lerobot_revision
     root = data_config.lerobot_root
+    subset_dataset_indices = None
     if policy_aux_config is not None:
         aux_episodes = policy_aux_config.lerobot_episode_indices()
         aux_revision = policy_aux_config.lerobot_revision
@@ -157,6 +176,14 @@ def create_torch_dataset(
         if root is not None and root != aux_root:
             raise ValueError("DataConfig and policy_aux select different LeRobot roots")
         episodes, revision, root = aux_episodes, aux_revision, aux_root
+        if policy_aux_config.lerobot_task_indices is not None:
+            # LeRobot v2.0 builds a compact episode_data_index for selected
+            # episodes but indexes it with original, non-contiguous episode
+            # IDs. Load the canonical contiguous LIBERO-10 population so its
+            # action-chunk boundaries stay valid, then expose only approved
+            # frame identities through a read-only wrapper.
+            episodes = list(range(_policy_aux_dataset.CANONICAL_LIBERO_EPISODES))
+            subset_dataset_indices = policy_aux_config.lerobot_dataset_indices()
     dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id, root=root, revision=revision)
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
@@ -167,6 +194,8 @@ def create_torch_dataset(
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
     )
+    if subset_dataset_indices is not None:
+        dataset = IndexedSubsetDataset(dataset, subset_dataset_indices)
 
     if data_config.prompt_from_task:
         dataset = TransformedDataset(dataset, [_transforms.PromptFromLeRobotTask(dataset_meta.tasks)])

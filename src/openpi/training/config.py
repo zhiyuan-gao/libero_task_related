@@ -585,6 +585,20 @@ class TrainConfig:
                 "lambda_sem": 0.01,
                 "diagnostic_skip_semantic_lm": False,
             },
+            "pi05_libero3_p1_aux": {
+                "mode": "geometry",
+                "lambda_geo": 0.15,
+                "lambda_ground": None,
+                "lambda_sem": None,
+                "diagnostic_skip_semantic_lm": False,
+            },
+            "pi05_libero3_p2_aux": {
+                "mode": "ground_geometry_semantic_lm",
+                "lambda_geo": 0.15,
+                "lambda_ground": 0.50,
+                "lambda_sem": 0.01,
+                "diagnostic_skip_semantic_lm": False,
+            },
         }
         if expected := frozen_policy_aux.get(self.name):
             if self.policy_aux is None or not self.policy_aux.loss_coefficients_approved:
@@ -599,6 +613,12 @@ class TrainConfig:
             if observed != expected:
                 raise ValueError(
                     f"{self.name} auxiliary architecture/lambdas are frozen: expected={expected}, observed={observed}"
+                )
+            if self.name.startswith("pi05_libero3_") and (
+                tuple(self.policy_aux.lerobot_task_indices or ()) != _policy_aux_dataset.LIBERO3_PILOT_TASK_INDICES
+            ):
+                raise ValueError(
+                    f"{self.name} requires frozen LeRobot task indices {_policy_aux_dataset.LIBERO3_PILOT_TASK_INDICES}"
                 )
         diagnostic_name = "pi05_libero_p2_ground_only_diagnostic"
         if self.policy_aux is not None and self.policy_aux.diagnostic_skip_semantic_lm:
@@ -626,6 +646,8 @@ _POLICY_AUX_LIBERO_ASSETS = "/workspace/vla/models/openpi/pi05_libero_pytorch/as
 # frame ratio gives 11,131.48 and 3,710.49 respectively.
 _POLICY_AUX_NUM_TRAIN_STEPS = 11_132
 _POLICY_AUX_WARMUP_STEPS = 3_710
+_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS = 3_209
+_POLICY_AUX_LIBERO3_WARMUP_STEPS = 1_069
 
 
 # Use `get_config` if you need to get a config by name in your code.
@@ -940,6 +962,81 @@ _CONFIGS = [
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=_POLICY_AUX_NUM_TRAIN_STEPS,
+    ),
+    # Reduced three-task pilot selected before training from official LeRobot
+    # task indices 0, 3, and 8. It preserves the full P1/P2 architecture and
+    # optimizer recipe while matching the original 28.085 effective epochs.
+    TrainConfig(
+        name="pi05_libero3_p1_aux",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        policy_aux=_policy_aux_dataset.PolicyAuxTrainConfig(
+            mode="geometry",
+            policy_manifest_path=f"{_POLICY_AUX_ROOT}/manifests/libero10_policy_aux_manifest.parquet",
+            episode_mapping_path=f"{_POLICY_AUX_ROOT}/debug/lerobot_episode_mapping.json",
+            geometry_target_index_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/target_index.parquet",
+            geometry_normalization_path=(f"{_POLICY_AUX_ROOT}/geometry_libero10/normalization/train_mean_std.json"),
+            lambda_geo=0.15,
+            lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+            lerobot_task_indices=_policy_aux_dataset.LIBERO3_PILOT_TASK_INDICES,
+            loss_coefficients_approved=True,
+        ),
+        batch_size=256,
+        gradient_accumulation_steps=1,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=_POLICY_AUX_LIBERO3_WARMUP_STEPS,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
+        num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
+    ),
+    TrainConfig(
+        name="pi05_libero3_p2_aux",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        policy_aux=_policy_aux_dataset.PolicyAuxTrainConfig(
+            mode="ground_geometry_semantic_lm",
+            policy_manifest_path=f"{_POLICY_AUX_ROOT}/manifests/libero10_policy_aux_manifest.parquet",
+            episode_mapping_path=f"{_POLICY_AUX_ROOT}/debug/lerobot_episode_mapping.json",
+            geometry_target_index_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/target_index.parquet",
+            geometry_normalization_path=(f"{_POLICY_AUX_ROOT}/geometry_libero10/normalization/train_mean_std.json"),
+            lambda_sem=0.01,
+            lambda_ground=0.50,
+            lambda_geo=0.15,
+            lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+            lerobot_task_indices=_policy_aux_dataset.LIBERO3_PILOT_TASK_INDICES,
+            loss_coefficients_approved=True,
+        ),
+        batch_size=256,
+        gradient_accumulation_steps=1,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=_POLICY_AUX_LIBERO3_WARMUP_STEPS,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
+        num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
     ),
     # Diagnostic-only P2 ablation. It intentionally preserves the complete P2
     # query layout, Ground preprocessing/head/loss, semantic target loading,

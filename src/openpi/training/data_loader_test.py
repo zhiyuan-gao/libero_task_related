@@ -2,11 +2,24 @@ import dataclasses
 import math
 
 import jax
+import pytest
 import torch
 
 from openpi.models import pi0_config
 from openpi.training import config as _config
 from openpi.training import data_loader as _data_loader
+
+
+def test_indexed_subset_dataset_preserves_base_indices():
+    dataset = list(range(10))
+    subset = _data_loader.IndexedSubsetDataset(dataset, [7, 1, 9])
+
+    assert len(subset) == 3
+    assert [subset[index] for index in range(len(subset))] == [7, 1, 9]
+    with pytest.raises(ValueError, match="non-empty and unique"):
+        _data_loader.IndexedSubsetDataset(dataset, [1, 1])
+    with pytest.raises(IndexError, match="outside the base dataset"):
+        _data_loader.IndexedSubsetDataset(dataset, [10])
 
 
 def test_torch_data_loader():

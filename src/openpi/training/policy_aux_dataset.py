@@ -27,6 +27,9 @@ PolicyAuxMode = Literal["geometry", "ground_geometry_semantic_lm"]
 CANONICAL_LIBERO_REVISION = "a4336d589d589045d1c56423ffdf3b88a0e19b1f"
 CANONICAL_LIBERO_EPISODES = 379
 CANONICAL_LIBERO_FRAMES = 101_469
+LIBERO3_PILOT_TASK_INDICES = (0, 3, 8)
+LIBERO3_PILOT_EPISODES = 114
+LIBERO3_PILOT_FRAMES = 29_250
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,6 +52,7 @@ class PolicyAuxTrainConfig:
     ground_focal_gamma: float = 2.0
     lerobot_revision: str = CANONICAL_LIBERO_REVISION
     lerobot_root: str | None = None
+    lerobot_task_indices: tuple[int, ...] | None = None
     loss_coefficients_approved: bool = False
     # Diagnostic-only ablation: retain the complete P2 data/layout/Ground path
     # while omitting only the native semantic-LM model pass and loss.
@@ -78,8 +82,16 @@ class PolicyAuxTrainConfig:
             )
         if self.lerobot_root is not None and Path(self.lerobot_root).name != self.lerobot_revision:
             raise ValueError("LeRobot snapshot directory does not match the frozen revision")
+        if (
+            self.lerobot_task_indices is not None
+            and tuple(self.lerobot_task_indices) != LIBERO3_PILOT_TASK_INDICES
+        ):
+            raise ValueError(
+                "The only approved reduced pilot population is LeRobot task indices "
+                f"{LIBERO3_PILOT_TASK_INDICES}"
+            )
 
-    def lerobot_episode_indices(self) -> list[int]:
+    def _validated_mapping_records(self) -> list[dict]:
         mapping = json.loads(Path(self.episode_mapping_path).read_text())
         if mapping.get("status") != "PASS":
             raise ValueError("Policy episode mapping must have PASS status")
@@ -96,7 +108,40 @@ class PolicyAuxTrainConfig:
         episodes = sorted(int(row["lerobot_episode_index"]) for row in records)
         if episodes != list(range(CANONICAL_LIBERO_EPISODES)):
             raise ValueError("P1/P2 policy data must be exactly official LIBERO-10 episodes 0..378")
-        return episodes
+        records = sorted(records, key=lambda row: int(row["lerobot_episode_index"]))
+        if self.lerobot_task_indices is None:
+            return records
+
+        selected_tasks = set(self.lerobot_task_indices)
+        records = [row for row in records if int(row["lerobot_task_index"]) in selected_tasks]
+        if (
+            len(records) != LIBERO3_PILOT_EPISODES
+            or sum(int(row["episode_length"]) for row in records) != LIBERO3_PILOT_FRAMES
+            or {int(row["lerobot_task_index"]) for row in records} != selected_tasks
+        ):
+            raise ValueError(
+                "The approved three-task pilot must resolve to exactly "
+                f"{LIBERO3_PILOT_EPISODES} episodes and {LIBERO3_PILOT_FRAMES} frames"
+            )
+        return records
+
+    def lerobot_episode_indices(self) -> list[int]:
+        return [int(row["lerobot_episode_index"]) for row in self._validated_mapping_records()]
+
+    def lerobot_dataset_indices(self) -> list[int]:
+        """Map subset-local rows back to immutable full-dataset frame identities."""
+
+        indices = []
+        for row in self._validated_mapping_records():
+            start = int(row["dataset_from_index"])
+            stop = int(row["dataset_to_index_exclusive"])
+            if stop - start != int(row["episode_length"]):
+                raise ValueError(f"Invalid dataset range in episode mapping: {row}")
+            indices.extend(range(start, stop))
+        expected = CANONICAL_LIBERO_FRAMES if self.lerobot_task_indices is None else LIBERO3_PILOT_FRAMES
+        if len(indices) != expected or len(set(indices)) != expected:
+            raise ValueError("Selected LeRobot frame identities are incomplete or duplicated")
+        return indices
 
 
 class PolicySemanticTokenizer:
@@ -355,8 +400,11 @@ class PolicyAuxTransformedDataset:
         self.dataset = dataset
         self.config = config
         self._target_index: PolicyAuxTargetIndex | None = None
-        if len(dataset) != 101_469:
-            raise ValueError(f"Expected official LIBERO-10 dataset length 101469, found {len(dataset)}")
+        self._dataset_indices = np.asarray(config.lerobot_dataset_indices(), dtype=np.int64)
+        if len(dataset) != len(self._dataset_indices):
+            raise ValueError(
+                f"Expected selected LIBERO dataset length {len(self._dataset_indices)}, found {len(dataset)}"
+            )
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -370,4 +418,5 @@ class PolicyAuxTransformedDataset:
         item = self.dataset[index]
         if "policy_aux" in item:
             raise ValueError("Base transformed dataset unexpectedly contains policy_aux")
-        return {**item, "policy_aux": self._target_index.item(index)}
+        dataset_index = int(self._dataset_indices[int(index)])
+        return {**item, "policy_aux": self._target_index.item(dataset_index)}
