@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import collections
 import dataclasses
 import logging
@@ -16,6 +18,7 @@ import tyro
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
+LIBERO3_BENCHMARK_TASK_IDS = (4, 2, 3)
 
 
 @dataclasses.dataclass
@@ -36,6 +39,9 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
+    task_ids: tuple[int, ...] = LIBERO3_BENCHMARK_TASK_IDS
+    num_shards: int = 1
+    shard_index: int = 0
 
     #################################################################################################################
     # Utils
@@ -49,6 +55,10 @@ class Args:
 
 
 def _validate_formal_protocol(args: Args) -> None:
+    if args.num_shards < 1:
+        raise ValueError("num_shards must be positive")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError(f"shard_index must be in [0, {args.num_shards}), got {args.shard_index}")
     if not args.formal:
         return
     expected = {
@@ -58,6 +68,7 @@ def _validate_formal_protocol(args: Args) -> None:
         "num_steps_wait": 10,
         "num_trials_per_task": 50,
         "seed": 7,
+        "task_ids": LIBERO3_BENCHMARK_TASK_IDS,
     }
     observed = {name: getattr(args, name) for name in expected}
     if observed != expected:
@@ -65,6 +76,16 @@ def _validate_formal_protocol(args: Args) -> None:
             "Formal LIBERO evaluation parameters are frozen. "
             f"expected={expected}, observed={observed}. Use --no-formal only for smoke/debug evaluation."
         )
+
+
+def _episode_ids_for_shard(
+    task_position: int, num_trials_per_task: int, num_shards: int, shard_index: int
+) -> list[int]:
+    return [
+        episode_idx
+        for episode_idx in range(num_trials_per_task)
+        if (task_position * num_trials_per_task + episode_idx) % num_shards == shard_index
+    ]
 
 
 def eval_libero(args: Args) -> None:
@@ -78,6 +99,10 @@ def eval_libero(args: Args) -> None:
     task_suite = benchmark_dict[args.task_suite_name]()
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
+    if any(task_id < 0 or task_id >= num_tasks_in_suite for task_id in args.task_ids):
+        raise ValueError(f"task_ids must be within [0, {num_tasks_in_suite}), got {args.task_ids}")
+    logging.info(f"Benchmark task IDs: {args.task_ids}")
+    logging.info(f"Evaluation shard: {args.shard_index}/{args.num_shards}")
 
     pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
 
@@ -98,7 +123,7 @@ def eval_libero(args: Args) -> None:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks_in_suite)):
+    for task_position, task_id in enumerate(args.task_ids):
         # Get task
         task = task_suite.get_task(task_id)
 
@@ -111,7 +136,10 @@ def eval_libero(args: Args) -> None:
         try:
             # Start episodes
             task_episodes, task_successes = 0, 0
-            for episode_idx in tqdm.tqdm(range(args.num_trials_per_task)):
+            episode_ids = _episode_ids_for_shard(
+                task_position, args.num_trials_per_task, args.num_shards, args.shard_index
+            )
+            for episode_idx in tqdm.tqdm(episode_ids):
                 logging.info(f"\nTask: {task_description}")
 
                 # Reset environment
@@ -208,6 +236,13 @@ def eval_libero(args: Args) -> None:
 
                 # Log current results
                 logging.info(f"Success: {done}")
+                logging.info(
+                    "Episode result: task_id=%d episode_idx=%d shard_index=%d success=%s",
+                    task_id,
+                    episode_idx,
+                    args.shard_index,
+                    done,
+                )
                 logging.info(f"# episodes completed so far: {total_episodes}")
                 logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
