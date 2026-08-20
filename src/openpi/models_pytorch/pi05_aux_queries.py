@@ -722,11 +722,13 @@ class PI05AuxPolicy(PI0Pytorch):
         if not self.aux_enabled:
             raise RuntimeError("forward_with_aux requires an enabled auxiliary mode")
         if semantic_impl is None:
-            semantic_impl = "two_pass_reference" if self.aux_config.mode == "semantic_geometry" else "joint_masked"
+            # Production Semantic follows the frozen P2 implementation.  The
+            # two-pass path remains available only as an explicit numerical
+            # reference; Semantic+Geometry differs from P2 solely by removing
+            # Ground data, queries, head, and loss.
+            semantic_impl = "joint_masked"
         if semantic_impl not in ("two_pass_reference", "joint_masked"):
             raise ValueError(f"Unsupported semantic implementation: {semantic_impl}")
-        if self.aux_config.mode == "semantic_geometry" and semantic_impl != "two_pass_reference":
-            raise ValueError("Semantic+Geometry requires the independent native PaliGemma semantic pass")
         if self.aux_config.mode not in ("semantic_geometry", "ground_geometry_semantic_lm") and semantic_impl != "joint_masked":
             raise ValueError("The semantic implementation selector requires an enabled Semantic mode")
 

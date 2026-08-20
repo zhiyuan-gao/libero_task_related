@@ -21,6 +21,7 @@ readonly total_updates=3209
 readonly warmup_updates=1069
 readonly lambda_geo=0.15
 readonly lambda_sem=0.01
+readonly keep_period=1000
 
 export OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=1
 export OPENPI_LOG_MEMORY_STATS=0
@@ -60,6 +61,7 @@ assert cfg.batch_size == 256
 assert cfg.gradient_accumulation_steps == 1
 assert cfg.num_train_steps == 3209
 assert cfg.lr_schedule.warmup_steps == 1069
+assert cfg.keep_period == 1000
 print("SEMANTIC_GEOMETRY_CONFIG_GATE=PASS")
 PY
 
@@ -69,6 +71,7 @@ common_args=(
   --gradient-accumulation-steps "$accumulation_steps"
   --num-workers "$num_workers"
   --checkpoint-base-dir "$checkpoint_base_dir"
+  --keep-period "$keep_period"
   --policy-aux.loss-coefficients-approved
   --policy-aux.lambda-geo "$lambda_geo"
   --policy-aux.lambda-sem "$lambda_sem"

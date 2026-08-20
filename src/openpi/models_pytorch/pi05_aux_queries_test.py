@@ -229,6 +229,40 @@ def test_joint_p2_attention_has_exact_branch_connectivity_and_padding() -> None:
         assert bool(mask[:, padded_index].any()) is False
 
 
+def test_semantic_geometry_uses_p2_joint_mask_without_ground() -> None:
+    base_layout = PrefixLayout(
+        view_spans={"agent": TokenSpan(0, 2), "wrist": TokenSpan(2, 4)},
+        real_view_names=("agent", "wrist"),
+        padded_view_names=(),
+        language=TokenSpan(4, 6),
+        context=TokenSpan(0, 6),
+        geometry=TokenSpan(6, 8),
+        ground=None,
+    )
+    layout = JointP2TrainLayout(
+        base_layout=base_layout,
+        semantic=TokenSpan(8, 11),
+        action_suffix=TokenSpan(11, 14),
+    )
+    paligemma_pad = torch.ones((1, 11), dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    suffix_ar = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    mask = build_joint_p2_attention(paligemma_pad, suffix_pad, suffix_ar, layout)[0]
+
+    # Geometry follows the P2 isolated-query rule and Semantic reads only
+    # Context plus its causal teacher prefix.
+    assert bool(mask[6:8, :6].all()) is True
+    assert bool(mask[6:8, 6:8].all()) is True
+    assert bool(mask[6:8, 8:].any()) is False
+    assert bool(mask[8:11, :6].all()) is True
+    assert bool(mask[8:11, 6:8].any()) is False
+
+    # The Action suffix reads Context and Geometry exactly as P2 does after
+    # deleting Ground, while Semantic teacher tokens remain structurally hidden.
+    assert bool(mask[11:14, :8].all()) is True
+    assert bool(mask[11:14, 8:11].any()) is False
+
+
 def test_joint_p2_positions_match_old_main_and_semantic_references() -> None:
     layout = _joint_p2_layout()
     base_pad = torch.tensor([[1, 1, 1, 1, 1, 0, 1, 1, 1, 1]], dtype=torch.bool)

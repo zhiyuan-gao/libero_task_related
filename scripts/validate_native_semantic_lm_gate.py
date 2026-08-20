@@ -44,13 +44,34 @@ def replacement_semantic_targets(
     replacement_text: str,
     device: torch.device,
 ) -> PolicyAuxTargets:
+    # The production collator dynamically pads SemanticTeacher to the longest
+    # target in each batch.  Select an equal-token-length real target and keep
+    # both the physical sequence and validity mask unchanged, so this changes
+    # teacher token content only (the same isolation test as P2).
     replacement = PolicySemanticTokenizer().batch([replacement_text])
+    replacement_input_ids = torch.from_numpy(replacement.input_ids).to(device)
+    replacement_labels = torch.from_numpy(replacement.labels).to(device)
+    replacement_loss_mask = torch.from_numpy(replacement.loss_mask).to(device)
+    if replacement_input_ids.shape != base.semantic_input_ids.shape:
+        raise RuntimeError("Replacement semantic teacher changed the physical sequence length")
+    if not torch.equal(replacement_loss_mask, base.semantic_loss_mask):
+        raise RuntimeError("Replacement semantic teacher must preserve the validity/loss mask")
     return dataclasses.replace(
         base,
-        semantic_input_ids=torch.from_numpy(replacement.input_ids).to(device),
-        semantic_labels=torch.from_numpy(replacement.labels).to(device),
-        semantic_loss_mask=torch.from_numpy(replacement.loss_mask).to(device),
+        semantic_input_ids=replacement_input_ids,
+        semantic_labels=replacement_labels,
+        semantic_loss_mask=replacement_loss_mask,
     )
+
+
+def select_equal_length_replacement(inventory: dict, original_text: str) -> str:
+    tokenizer = PolicySemanticTokenizer()
+    original_length = len(tokenizer.encode_target(original_text))
+    for row in inventory["targets"]:
+        candidate = row["canonical_original_string"]
+        if candidate != original_text and len(tokenizer.encode_target(candidate)) == original_length:
+            return candidate
+    raise RuntimeError(f"No equal-token-length semantic replacement exists for {original_text!r}")
 
 
 def run_full_forward(
@@ -98,11 +119,7 @@ def main() -> None:
         include_ground_masks=args.mode == "ground_geometry_semantic_lm",
     )
     inventory = json.loads(args.semantic_inventory.read_text())
-    replacement_text = next(
-        row["canonical_original_string"]
-        for row in inventory["targets"]
-        if row["canonical_original_string"] != auxiliary["semantic_text"]
-    )
+    replacement_text = select_equal_length_replacement(inventory, auxiliary["semantic_text"])
     observation = move_observation(observation, device)
     actions = actions.to(device)
     config = pi0_config.Pi0Config(
@@ -158,6 +175,7 @@ def main() -> None:
     second_semantic = second["losses"]["semantic"]
     changed_semantic = changed_target["losses"]["semantic"]
     layout = first["layout"]
+    joint_train_layout = first.get("joint_train_layout")
 
     # Run the semantic pass alone so its gradient provenance cannot include the
     # action expert or either auxiliary query group.
@@ -222,6 +240,7 @@ def main() -> None:
             args.mode != "semantic_geometry"
             or (not hasattr(model, "ground_queries") and not hasattr(model, "ground_head"))
         ),
+        "production_uses_p2_joint_masked_semantic": joint_train_layout is not None,
         "semantic_loss_is_finite": bool(torch.isfinite(first_semantic)),
         "fixed_input_action_is_bitwise_deterministic": bool(torch.equal(first_action, second_action)),
         "fixed_input_semantic_ce_is_bitwise_deterministic": bool(torch.equal(first_semantic, second_semantic)),
@@ -258,8 +277,9 @@ def main() -> None:
         "architecture": {
             "action_prefix_query_groups": list(layout.query_groups),
             "semantic_query_count": 0,
-            "semantic_objective": "separate native PaliGemma autoregressive LM pass",
-            "teacher_tokens_present_in_action_prefix": False,
+            "semantic_objective": "P2 joint-masked native PaliGemma autoregressive CE",
+            "teacher_tokens_present_in_joint_training_sequence": True,
+            "action_can_attend_semantic_teacher_tokens": False,
             "action_expert_forward_calls_in_semantic_only_pass": expert_forward_calls,
         },
         "metrics": {

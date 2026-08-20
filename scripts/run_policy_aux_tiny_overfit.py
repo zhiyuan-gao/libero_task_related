@@ -503,7 +503,9 @@ def main() -> None:
         "mode": args.mode,
         "architecture": {
             "geometry": "Context|Geometryx8|Action",
-            "semantic_geometry": "Context|Geometryx8|Action + separate native semantic LM",
+            "semantic_geometry": (
+                "P2 joint-masked Context|Geometryx8|SemanticTeacher + Action suffix, with Ground removed"
+            ),
             "ground_geometry_semantic_lm": (
                 "Context|Geometryx8|Groundx8|Action + native semantic LM"
             ),

@@ -1056,6 +1056,8 @@ _CONFIGS = [
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
+        # Every scheduled full-run checkpoint (1000/2000/3000) is retained.
+        keep_period=1000,
     ),
     TrainConfig(
         name="pi05_libero3_p2_aux",
