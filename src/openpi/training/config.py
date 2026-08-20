@@ -924,7 +924,9 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
+        # Project default: keep optimizer-updated RAW weights. The local FP32
+        # EMA v2 path remains experimental until real multi-GPU validation.
+        ema_decay=None,
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=_POLICY_AUX_NUM_TRAIN_STEPS,
@@ -962,7 +964,9 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
+        # Project default: keep optimizer-updated RAW weights. The local FP32
+        # EMA v2 path remains experimental until real multi-GPU validation.
+        ema_decay=None,
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=_POLICY_AUX_NUM_TRAIN_STEPS,
@@ -1000,7 +1004,9 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
+        # Project default: keep optimizer-updated RAW weights. The local FP32
+        # EMA v2 path remains experimental until real multi-GPU validation.
+        ema_decay=None,
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
@@ -1037,7 +1043,9 @@ _CONFIGS = [
             decay_lr=5e-5,
         ),
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
-        ema_decay=0.999,
+        # Project default: keep optimizer-updated RAW weights. The local FP32
+        # EMA v2 path remains experimental until real multi-GPU validation.
+        ema_decay=None,
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,

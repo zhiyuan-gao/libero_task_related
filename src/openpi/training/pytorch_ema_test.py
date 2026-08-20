@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import safetensors.torch
 import torch
 
@@ -92,3 +93,72 @@ def test_ema_foreach_update_matches_scalar_formula_for_mixed_dtypes() -> None:
         assert torch.equal(averaged["float32"], initial["float32"] * 0.75 + raw["float32"] * 0.25)
         assert torch.equal(averaged["float64"], initial["float64"] * 0.75 + raw["float64"] * 0.25)
         assert torch.equal(averaged["frozen_integer"], raw["frozen_integer"])
+
+
+def test_bfloat16_parameters_accumulate_ema_in_float32() -> None:
+    model = torch.nn.Linear(1, 1, bias=False, dtype=torch.bfloat16)
+    with torch.no_grad():
+        model.weight.fill_(1.0)
+    ema = pytorch_ema.ExponentialMovingAverage(model, 0.999)
+
+    with torch.no_grad():
+        model.weight.fill_(1.0078125)  # The next BF16 value above 1.0.
+    raw = model.weight.detach().clone()
+    legacy_bfloat16_shadow = torch.ones_like(raw)
+    for _ in range(1000):
+        ema.update(model)
+        legacy_bfloat16_shadow.mul_(0.999).add_(raw, alpha=0.001)
+
+    expected = 1.0 * 0.999**1000 + float(raw.item()) * (1.0 - 0.999**1000)
+    assert legacy_bfloat16_shadow.item() == 1.0
+    with ema.average_parameters(model):
+        assert model.weight.dtype == torch.float32
+        assert model.weight.item() == pytest.approx(expected, abs=2e-5)
+        assert model.weight.item() > 1.003
+
+    assert model.weight.dtype == torch.bfloat16
+    assert torch.equal(model.weight, raw)
+    assert ema.metadata()["shadow_dtypes"] == (("weight", "torch.float32"),)
+
+
+def test_bfloat16_raw_and_float32_ema_checkpoint_roundtrip(tmp_path) -> None:
+    model = torch.nn.Linear(2, 1, bias=False, dtype=torch.bfloat16)
+    ema = pytorch_ema.ExponentialMovingAverage(model, 0.999)
+    with torch.no_grad():
+        model.weight.add_(0.125)
+    ema.update(model)
+
+    raw_reference = model.weight.detach().clone()
+    with ema.average_parameters(model):
+        ema_reference = model.weight.detach().clone()
+
+    raw_path = tmp_path / "train_model.safetensors"
+    ema_path = tmp_path / "model.safetensors"
+    safetensors.torch.save_model(model, raw_path)
+    ema.save_model(model, ema_path)
+
+    assert safetensors.torch.load_file(raw_path)["weight"].dtype == torch.bfloat16
+    assert safetensors.torch.load_file(ema_path)["weight"].dtype == torch.float32
+
+    resumed = torch.nn.Linear(2, 1, bias=False, dtype=torch.bfloat16)
+    resumed_ema = pytorch_ema.ExponentialMovingAverage(resumed, 0.999)
+    safetensors.torch.load_model(resumed, raw_path, strict=True, device="cpu")
+    resumed_ema.load_model(resumed, ema_path, device="cpu")
+    resumed_ema.load_metadata(ema.metadata(), resumed)
+
+    assert resumed.weight.dtype == torch.bfloat16
+    assert torch.equal(resumed.weight, raw_reference)
+    with resumed_ema.average_parameters(resumed):
+        assert resumed.weight.dtype == torch.float32
+        assert torch.equal(resumed.weight, ema_reference)
+
+
+def test_rejects_legacy_same_dtype_ema_metadata() -> None:
+    model = torch.nn.Linear(1, 1, dtype=torch.bfloat16)
+    ema = pytorch_ema.ExponentialMovingAverage(model, 0.999)
+    legacy_metadata = ema.metadata()
+    legacy_metadata["schema"] = "openpi.pytorch_ema.v1"
+    legacy_metadata.pop("shadow_dtypes")
+
+    with pytest.raises(RuntimeError, match="Unsupported EMA metadata"):
+        ema.load_metadata(legacy_metadata, model)

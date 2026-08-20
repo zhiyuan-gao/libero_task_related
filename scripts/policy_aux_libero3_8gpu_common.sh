@@ -20,7 +20,6 @@ readonly local_micro_batch=32
 readonly effective_batch=256
 readonly frozen_num_train_steps=3209
 readonly frozen_warmup_steps=1069
-readonly frozen_ema_decay=0.999
 readonly frozen_lambda_geo=0.15
 readonly frozen_lambda_ground=0.50
 readonly frozen_lambda_sem=0.01
@@ -72,7 +71,6 @@ common_args=(
   --gradient-accumulation-steps "$accumulation_steps"
   --num-workers "$num_workers"
   --checkpoint-base-dir "$checkpoint_base_dir"
-  --ema-decay "$frozen_ema_decay"
   --policy-aux.loss-coefficients-approved
   "${lambda_args[@]}"
 )

@@ -25,18 +25,21 @@ class _ResumeLoader:
 
 
 def _config_for_checkpoint(tmp_path, **changes) -> _config.TrainConfig:
+    values = {
+        "exp_name": "ema_roundtrip",
+        "checkpoint_base_dir": str(tmp_path),
+        "ema_decay": 0.9,
+        "num_train_steps": 3,
+        "save_interval": 3,
+        "keep_period": 2,
+        "overwrite": False,
+        "resume": False,
+        "wandb_enabled": False,
+    }
+    values.update(changes)
     config = dataclasses.replace(
         _config.get_config("debug"),
-        exp_name="ema_roundtrip",
-        checkpoint_base_dir=str(tmp_path),
-        ema_decay=0.9,
-        num_train_steps=3,
-        save_interval=3,
-        keep_period=2,
-        overwrite=False,
-        resume=False,
-        wandb_enabled=False,
-        **changes,
+        **values,
     )
     config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
     return config
@@ -136,6 +139,52 @@ def test_checkpoint_roundtrip_restores_raw_ema_and_allows_runtime_changes(tmp_pa
     with resumed_ema.average_parameters(resumed_model):
         for name, parameter in resumed_model.named_parameters():
             assert torch.equal(parameter, ema_reference[name])
+
+
+def test_checkpoint_roundtrip_without_ema_uses_standard_model_file(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(train_pytorch, "log_memory_usage", lambda *args, **kwargs: None)
+    torch.manual_seed(41)
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    model(torch.ones(2, 3)).square().mean().backward()
+    optimizer.step()
+    raw_reference = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+
+    config = _config_for_checkpoint(tmp_path, ema_decay=None)
+    train_pytorch.save_checkpoint(
+        model,
+        optimizer,
+        3,
+        config,
+        is_main=True,
+        data_config=SimpleNamespace(norm_stats=None, asset_id=None),
+        data_loader=_ResumeLoader(83),
+        ema=None,
+        micro_step_in_update=0,
+    )
+    checkpoint = config.checkpoint_dir / "3"
+    assert (checkpoint / "model.safetensors").is_file()
+    assert not (checkpoint / "train_model.safetensors").exists()
+    metadata = torch.load(checkpoint / "metadata.pt", map_location="cpu", weights_only=False)
+    assert metadata["ema"] is None
+
+    resumed_model = torch.nn.Linear(3, 2)
+    resumed_optimizer = torch.optim.AdamW(resumed_model.parameters(), lr=1e-3)
+    resumed_loader = _ResumeLoader(999)
+    step = train_pytorch.load_checkpoint(
+        resumed_model,
+        resumed_optimizer,
+        config.checkpoint_dir,
+        torch.device("cpu"),
+        resumed_loader,
+        dataclasses.replace(config, num_train_steps=4, resume=True),
+        None,
+    )
+
+    assert step == 3
+    assert resumed_loader.loaded == {"token": 83}
+    for name, parameter in resumed_model.named_parameters():
+        assert torch.equal(parameter, raw_reference[name])
 
 
 def test_checkpoint_refuses_trajectory_change_before_loading_weights(tmp_path, monkeypatch) -> None:

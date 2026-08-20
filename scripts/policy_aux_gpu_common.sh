@@ -36,7 +36,6 @@ readonly expected_effective_batch=256
 readonly expected_local_micro_batch=32
 readonly frozen_num_train_steps=11132
 readonly frozen_warmup_steps=3710
-readonly frozen_ema_decay=0.999
 
 # The legacy max_split_size/expandable-segments profile produced large periodic
 # reserved-memory swings on 8xA100. train_pytorch.py removes any inherited
@@ -129,7 +128,6 @@ common_args=(
   --gradient-accumulation-steps "$accumulation_steps"
   --num-workers "$num_workers"
   --checkpoint-base-dir "$checkpoint_base_dir"
-  --ema-decay "$frozen_ema_decay"
   --policy-aux.loss-coefficients-approved
   "${lambda_args[@]}"
 )
@@ -154,7 +152,7 @@ case "$phase" in
       --log-interval 1 \
       --no-wandb-enabled \
       --overwrite
-    # One additional optimizer update proves raw/EMA weights, optimizer state,
+    # One additional optimizer update proves RAW weights, optimizer state,
     # data position, global step, and the stateless LR schedule resume exactly.
     run_train \
       --exp-name "$exp_name" \

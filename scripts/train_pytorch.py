@@ -444,8 +444,11 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, confi
             if not ema_path.exists():
                 raise FileNotFoundError(f"EMA inference parameters are missing: {ema_path}")
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-            ema.load_model(model_to_load, ema_path, device=str(device))
+            # Validate schema/dtypes before reading a multi-GB EMA file. In
+            # particular, v1 BF16 shadows must not be silently upcast and
+            # mistaken for full-precision EMA state.
             ema.load_metadata(saved_ema_metadata, model_to_load)
+            ema.load_model(model_to_load, ema_path, device=str(device))
             logging.info(f"Restored EMA parameters at update {ema.num_updates}")
 
         del metadata

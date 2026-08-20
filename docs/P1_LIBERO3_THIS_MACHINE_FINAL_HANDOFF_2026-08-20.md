@@ -66,8 +66,11 @@ shadow，SHA-256：
 ```
 
 它不能用于评估或部署。若继续训练，应显式载入 RAW `train_model.safetensors`
-作为 trainable weights，并从 RAW 权重重新初始化 FP32 EMA；不要继续载入旧的 BF16
-EMA shadow。迁移目录中的 `CHECKPOINT_README.md` 也重复记录了这一要求。
+作为 trainable weights。当前自研 P1/P2 默认关闭 EMA；不要继续载入旧的 BF16 EMA
+shadow。仓库中的 FP32 EMA v2 仅通过单元测试，尚未通过 8-GPU preflight、长程训练
+和闭环评估，不属于当前正式 recipe。原因、实验实现和旧 checkpoint 迁移规则见
+`docs/PYTORCH_BF16_EMA_FIX_2026-08-20.md`；迁移目录中的 `CHECKPOINT_README.md`
+也重复记录了这一要求。
 
 ## 4. 标准 LIBERO-10 三任务闭环结果
 
@@ -87,13 +90,25 @@ P1 RAW checkpoint 在相同 seed、初始状态、horizon、`replan=5`、每任�
 
 协议冻结为三项训练任务派生出的全部 872 个 Plus variants，每个 variant 使用第一个
 官方初始状态各跑一次：8 路 GPU/仿真并行、seed 7、输入 resize 224、`replan=5`、
-最大 520 policy steps。最终结果如下：
+最大 520 policy steps。评估按用户决定提前停止；以下是部分结果，不是完整 benchmark
+结果：
 
 <!-- LIBERO_PLUS_RESULT_START -->
-正式结果将在 872/872 完成后写入这里。
+| Task | Completed | Successes | Partial rate |
+| --- | ---: | ---: | ---: |
+| bowl | 184 | 44 | 23.91% |
+| moka | 203 | 43 | 21.18% |
+| mugs | 171 | 33 | 19.30% |
+| 合计 | 558/872 | 120 | 21.51% |
 <!-- LIBERO_PLUS_RESULT_END -->
 
-逐 variant JSONL、summary、日志和视频位于：
+variant 按类别排列，因此 aggregate 不是完整 872 variants 的无偏估计；Light Conditions
+和 Objects Layout 未开始，Sensor Noise 仅完成 38/144。详细类别统计和解释见
+`docs/P1_LIBERO_PLUS_PARTIAL_EVAL_2026-08-20.md`，机器可读汇总见
+`docs/results/p1_libero_plus_partial_summary_2026-08-20.json`。GitHub 不上传 rollout 视频。
+
+本机原始目录含逐 variant JSONL、summary、日志和视频；Google Drive 精简迁移包只保留
+结构化结果与日志，不含 LIBERO-Plus 视频：
 
 ```text
 artifacts/eval/libero_plus/p1_raw_formal_872_20260819T234400Z/
@@ -112,7 +127,8 @@ artifacts/logs/eval/p1_libero_plus_formal_872_20260819T234400Z/
 
 - `checkpoints/`：完整训练恢复 checkpoint 和 RAW serving checkpoint；
 - `data/`：P1/P2 辅助监督、calibration、manifests 和 provenance；
-- `artifacts/eval/`：标准评估、官方同协议对照、失败分析和 LIBERO-Plus 产物；
+- `artifacts/eval/`：标准评估、官方同协议对照和失败分析；Google Drive 精简包另含
+  LIBERO-Plus 的结构化结果，但不含其视频；
 - `artifacts/logs/`：训练、preflight、速度诊断和评估日志；
 - `code/`：此分支的离线 Git bundle；
 - `SHA256SUMS`：迁移文件的完整校验表；

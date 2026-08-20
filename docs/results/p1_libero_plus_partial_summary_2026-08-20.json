@@ -1,0 +1,22 @@
+{
+  "status": "stopped_early",
+  "stopped_at": "2026-08-20T00:37:45Z",
+  "planned_total": 872,
+  "total": 558,
+  "completion_fraction": 0.6399082568807339,
+  "successes": 120,
+  "success_rate": 0.21505376344086022,
+  "errors": 0,
+  "by_task": {
+    "bowl": {"total": 184, "successes": 44, "success_rate": 0.2391304347826087},
+    "moka": {"total": 203, "successes": 43, "success_rate": 0.21182266009852216},
+    "mugs": {"total": 171, "successes": 33, "success_rate": 0.19298245614035087}
+  },
+  "by_category": {
+    "Background Textures": {"total": 122, "successes": 53, "success_rate": 0.4344262295081967},
+    "Camera Viewpoints": {"total": 142, "successes": 4, "success_rate": 0.028169014084507043},
+    "Language Instructions": {"total": 130, "successes": 50, "success_rate": 0.38461538461538464},
+    "Robot Initial States": {"total": 126, "successes": 13, "success_rate": 0.10317460317460317},
+    "Sensor Noise": {"total": 38, "successes": 0, "success_rate": 0.0}
+  }
+}
