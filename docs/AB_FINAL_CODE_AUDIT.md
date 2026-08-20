@@ -2,7 +2,7 @@
 
 Date: 2026-08-20
 
-Status: code and dry-run handoff gates pass; formal training not started
+Status: code, handoff, real backward, and B 8-GPU 25+1 gates pass; formal training not started
 
 ## Lineage
 
@@ -45,5 +45,14 @@ dimensions. The 1,140 invalid episode-tail rows contribute exact zero.
   when A fails, and formal orchestration refuses to run without explicit approval.
 - Both A and B independently resolve the same strict FP32-converted base; B never
   consumes an A checkpoint.
+- B completed an 8×A100 preflight at global batch 256: 25 updates, RAW checkpoint
+  publication, exact eight-rank model/optimizer/RNG/data-state restoration, and
+  update 26. Excluding the compilation step, update time was approximately
+  5.2–5.5 seconds. The resumed update had total loss 1.61148, raw Motion loss
+  2.61935, weighted Motion contribution 0.13097, and gradient norm 32.03.
+
+Preflight checkpoint:
+
+`/workspace/vla/p3/checkpoints/semantic_geometry_motion/pi05_libero3_semantic_geometry_motion_aux/sgm_lambda005_final_preflight_20260820/25`
 
 The 8-GPU formal A/B launch remains blocked by the explicit confirmation guard.
