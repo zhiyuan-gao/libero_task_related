@@ -599,6 +599,13 @@ class TrainConfig:
                 "lambda_sem": 0.01,
                 "diagnostic_skip_semantic_lm": False,
             },
+            "pi05_libero3_semantic_geometry_aux": {
+                "mode": "semantic_geometry",
+                "lambda_geo": 0.15,
+                "lambda_ground": None,
+                "lambda_sem": 0.01,
+                "diagnostic_skip_semantic_lm": False,
+            },
         }
         if expected := frozen_policy_aux.get(self.name):
             if self.policy_aux is None or not self.policy_aux.loss_coefficients_approved:
@@ -1006,6 +1013,45 @@ _CONFIGS = [
         optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
         # Project default: keep optimizer-updated RAW weights. The local FP32
         # EMA v2 path remains experimental until real multi-GPU validation.
+        ema_decay=None,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
+        num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
+    ),
+    TrainConfig(
+        name="pi05_libero3_semantic_geometry_aux",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        policy_aux=_policy_aux_dataset.PolicyAuxTrainConfig(
+            mode="semantic_geometry",
+            policy_manifest_path=f"{_POLICY_AUX_ROOT}/manifests/libero10_policy_aux_manifest.parquet",
+            episode_mapping_path=f"{_POLICY_AUX_ROOT}/debug/lerobot_episode_mapping.json",
+            geometry_target_index_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/target_index.parquet",
+            geometry_normalization_path=(f"{_POLICY_AUX_ROOT}/geometry_libero10/normalization/train_mean_std.json"),
+            lambda_sem=0.01,
+            lambda_geo=0.15,
+            num_ground_queries=0,
+            lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+            lerobot_task_indices=_policy_aux_dataset.LIBERO3_PILOT_TASK_INDICES,
+            loss_coefficients_approved=True,
+        ),
+        batch_size=256,
+        gradient_accumulation_steps=1,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=_POLICY_AUX_LIBERO3_WARMUP_STEPS,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        # A/B comparison is explicitly RAW/no-EMA. The experimental EMA path
+        # is not part of this protocol.
         ema_decay=None,
         pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",

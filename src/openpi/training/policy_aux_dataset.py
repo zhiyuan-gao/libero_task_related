@@ -22,7 +22,7 @@ class SemanticTeacherTensors:
     loss_mask: np.ndarray
 
 
-PolicyAuxMode = Literal["geometry", "ground_geometry_semantic_lm"]
+PolicyAuxMode = Literal["geometry", "semantic_geometry", "ground_geometry_semantic_lm"]
 
 CANONICAL_LIBERO_REVISION = "a4336d589d589045d1c56423ffdf3b88a0e19b1f"
 CANONICAL_LIBERO_EPISODES = 379
@@ -59,13 +59,15 @@ class PolicyAuxTrainConfig:
     diagnostic_skip_semantic_lm: bool = False
 
     def __post_init__(self) -> None:
-        if self.mode not in ("geometry", "ground_geometry_semantic_lm"):
+        if self.mode not in ("geometry", "semantic_geometry", "ground_geometry_semantic_lm"):
             raise ValueError(f"Unsupported policy auxiliary training mode: {self.mode}")
         if self.diagnostic_skip_semantic_lm and self.mode != "ground_geometry_semantic_lm":
             raise ValueError("The semantic-LM ablation requires the complete P2 mode")
         required_lambdas = ["lambda_geo"]
+        if self.mode in ("semantic_geometry", "ground_geometry_semantic_lm"):
+            required_lambdas.append("lambda_sem")
         if self.mode == "ground_geometry_semantic_lm":
-            required_lambdas.extend(("lambda_sem", "lambda_ground"))
+            required_lambdas.append("lambda_ground")
         if self.loss_coefficients_approved and any(getattr(self, name) is None for name in required_lambdas):
             raise ValueError(f"Approved P1/P2 config is missing a required loss coefficient: {required_lambdas}")
         if self.loss_coefficients_approved and any(getattr(self, name) <= 0 for name in required_lambdas):
@@ -74,8 +76,16 @@ class PolicyAuxTrainConfig:
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative")
-        if self.num_ground_queries != 8 or self.num_geometry_queries != 8:
-            raise ValueError("P1/P2 v0 query counts are frozen at eight")
+        if self.num_geometry_queries != 8:
+            raise ValueError("Policy auxiliary Geometry query count is frozen at eight")
+        # Preserve the frozen legacy P1/P2 config schema while making the new
+        # Semantic+Geometry experiment explicitly Ground-free.
+        expected_ground_queries = 0 if self.mode == "semantic_geometry" else 8
+        if self.num_ground_queries != expected_ground_queries:
+            raise ValueError(
+                f"{self.mode} requires num_ground_queries={expected_ground_queries}, "
+                f"found {self.num_ground_queries}"
+            )
         if self.lerobot_revision != CANONICAL_LIBERO_REVISION:
             raise ValueError(
                 f"P1/P2 policy training is frozen to official LeRobot revision {CANONICAL_LIBERO_REVISION}"
@@ -376,11 +386,16 @@ class PolicyAuxTargetIndex:
         }
         if self.config.mode == "ground_geometry_semantic_lm":
             masks, ground_valid = self.annotations.load_upright_ground_masks(row)
-            semantic = self.semantic_tokenizer.fixed(str(row["semantic_subtask"]))
             result.update(
                 {
                     "ground_masks": masks,
                     "ground_valid_views": ground_valid,
+                }
+            )
+        if self.config.mode in ("semantic_geometry", "ground_geometry_semantic_lm"):
+            semantic = self.semantic_tokenizer.fixed(str(row["semantic_subtask"]))
+            result.update(
+                {
                     "semantic_input_ids": semantic.input_ids,
                     "semantic_labels": semantic.labels,
                     "semantic_loss_mask": semantic.loss_mask,

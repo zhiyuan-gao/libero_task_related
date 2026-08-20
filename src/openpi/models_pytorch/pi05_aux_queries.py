@@ -32,7 +32,7 @@ from openpi.models_pytorch.policy_aux_preprocessing import patch_foreground_cove
 from openpi.models_pytorch.policy_aux_preprocessing import preprocess_observation_and_ground_masks_pytorch
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
-PolicyAuxMode = Literal["none", "geometry", "ground_geometry_semantic_lm"]
+PolicyAuxMode = Literal["none", "geometry", "semantic_geometry", "ground_geometry_semantic_lm"]
 SemanticImplementation = Literal["two_pass_reference", "joint_masked"]
 
 # New branches use independent fixed RNG streams so shared P1/P2 Geometry
@@ -62,12 +62,18 @@ class PolicyAuxConfig:
     geometry_normalization_path: str | None = None
 
     def __post_init__(self) -> None:
-        if self.mode not in ("none", "geometry", "ground_geometry_semantic_lm"):
+        if self.mode not in ("none", "geometry", "semantic_geometry", "ground_geometry_semantic_lm"):
             raise ValueError(f"Unsupported policy_aux_mode: {self.mode}")
         if self.diagnostic_skip_semantic_lm and self.mode != "ground_geometry_semantic_lm":
             raise ValueError("The semantic-LM ablation requires the complete P2 mode")
-        if self.num_ground_queries != 8 or self.num_geometry_queries != 8:
-            raise ValueError("P1/P2 v0 require eight Grounding/Geometry queries")
+        if self.num_geometry_queries != 8:
+            raise ValueError("Policy auxiliary Geometry query count is frozen at eight")
+        expected_ground_queries = 0 if self.mode == "semantic_geometry" else 8
+        if self.num_ground_queries != expected_ground_queries:
+            raise ValueError(
+                f"{self.mode} requires num_ground_queries={expected_ground_queries}, "
+                f"found {self.num_ground_queries}"
+            )
         if self.geometry_target_dim != 2048:
             raise ValueError("P1/P2 v0 Geometry target dimension is frozen at 2048")
         for name in ("lambda_sem", "lambda_ground", "lambda_geo"):
@@ -390,7 +396,7 @@ class PI05AuxPolicy(PI0Pytorch):
         self.aux_config = aux_config
         self.hidden_dim = int(self.paligemma_with_expert.paligemma.language_model.config.hidden_size)
 
-        if aux_config.mode == "geometry":
+        if aux_config.mode in ("geometry", "semantic_geometry"):
             self.geometry_queries = self._new_queries(aux_config.num_geometry_queries, seed=GEOMETRY_QUERY_INIT_SEED)
             self.geometry_head = self._new_seeded_module(
                 GEOMETRY_HEAD_INIT_SEED,
@@ -709,16 +715,20 @@ class PI05AuxPolicy(PI0Pytorch):
         *,
         noise: torch.Tensor | None = None,
         time: torch.Tensor | None = None,
-        semantic_impl: SemanticImplementation = "joint_masked",
+        semantic_impl: SemanticImplementation | None = None,
         reference_semantic_attention_impl: Literal["eager", "sdpa"] = "sdpa",
         return_validation_outputs: bool = False,
     ) -> dict[str, torch.Tensor | PrefixLayout | JointP2TrainLayout | None | dict[str, torch.Tensor]]:
         if not self.aux_enabled:
             raise RuntimeError("forward_with_aux requires an enabled auxiliary mode")
+        if semantic_impl is None:
+            semantic_impl = "two_pass_reference" if self.aux_config.mode == "semantic_geometry" else "joint_masked"
         if semantic_impl not in ("two_pass_reference", "joint_masked"):
             raise ValueError(f"Unsupported semantic implementation: {semantic_impl}")
-        if self.aux_config.mode != "ground_geometry_semantic_lm" and semantic_impl != "joint_masked":
-            raise ValueError("The semantic implementation selector is P2-only")
+        if self.aux_config.mode == "semantic_geometry" and semantic_impl != "two_pass_reference":
+            raise ValueError("Semantic+Geometry requires the independent native PaliGemma semantic pass")
+        if self.aux_config.mode not in ("semantic_geometry", "ground_geometry_semantic_lm") and semantic_impl != "joint_masked":
+            raise ValueError("The semantic implementation selector requires an enabled Semantic mode")
 
         if self.aux_config.mode == "ground_geometry_semantic_lm":
             if aux_targets.ground_masks is None:
@@ -759,9 +769,10 @@ class PI05AuxPolicy(PI0Pytorch):
         )
         suffix, suffix_pad, suffix_ar, adarms_cond = self.embed_suffix(state, x_t, time)
 
-        semantic_enabled = (
-            self.aux_config.mode == "ground_geometry_semantic_lm" and not self.aux_config.diagnostic_skip_semantic_lm
-        )
+        semantic_enabled = self.aux_config.mode in (
+            "semantic_geometry",
+            "ground_geometry_semantic_lm",
+        ) and not self.aux_config.diagnostic_skip_semantic_lm
         teacher_input_mask = None
         semantic_anchor_indices = None
         joint_train_layout = None

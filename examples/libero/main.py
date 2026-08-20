@@ -42,9 +42,10 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
-    # Optional benchmark task subset. The only formal subset is the frozen
-    # three-task population corresponding to LeRobot task indices (0, 3, 8).
-    task_ids: typing.Optional[typing.Tuple[int, ...]] = None  # noqa: UP006, UP007 -- evaluator runs on Python 3.8
+    # Formal evaluation is the frozen three-task population corresponding to
+    # LeRobot task indices (0, 3, 8). Debug runs may override this with
+    # ``--no-formal``.
+    task_ids: typing.Tuple[int, ...] = LIBERO3_BENCHMARK_TASK_IDS  # noqa: UP006 -- evaluator runs on Python 3.8
     # Deterministic global sharding over (task position, episode index). This
     # lets multiple workers evaluate disjoint initial states without changing
     # the frozen number of trials per task.
@@ -79,7 +80,7 @@ def _validate_formal_protocol(args: Args) -> None:
             "Formal LIBERO evaluation parameters are frozen. "
             f"expected={expected}, observed={observed}. Use --no-formal only for smoke/debug evaluation."
         )
-    if args.task_ids is not None and tuple(args.task_ids) != LIBERO3_BENCHMARK_TASK_IDS:
+    if tuple(args.task_ids) != LIBERO3_BENCHMARK_TASK_IDS:
         raise ValueError(
             "Formal subset evaluation is frozen to LIBERO benchmark task IDs "
             f"{LIBERO3_BENCHMARK_TASK_IDS}, corresponding to LeRobot task indices (0, 3, 8); "
@@ -87,6 +88,21 @@ def _validate_formal_protocol(args: Args) -> None:
         )
     if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
         raise ValueError(f"Invalid evaluation shard: shard_index={args.shard_index}, num_shards={args.num_shards}")
+
+
+def _episode_ids_for_shard(
+    task_position: int,
+    num_trials_per_task: int,
+    num_shards: int,
+    shard_index: int,
+) -> typing.List[int]:  # noqa: UP006 -- evaluator runs on Python 3.8
+    """Deterministically partition the global (task, episode) rollout order."""
+
+    return [
+        episode_idx
+        for episode_idx in range(num_trials_per_task)
+        if (task_position * num_trials_per_task + episode_idx) % num_shards == shard_index
+    ]
 
 
 def eval_libero(args: Args) -> None:
@@ -101,7 +117,7 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    task_ids = tuple(range(num_tasks_in_suite)) if args.task_ids is None else tuple(args.task_ids)
+    task_ids = tuple(args.task_ids)
     if len(set(task_ids)) != len(task_ids) or any(task_id < 0 or task_id >= num_tasks_in_suite for task_id in task_ids):
         raise ValueError(f"Invalid or duplicate benchmark task IDs: {task_ids}; suite has {num_tasks_in_suite} tasks")
     logging.info(f"Benchmark task IDs: {task_ids}")
@@ -141,11 +157,12 @@ def eval_libero(args: Args) -> None:
         try:
             # Start episodes
             task_episodes, task_successes = 0, 0
-            episode_ids = [
-                episode_idx
-                for episode_idx in range(args.num_trials_per_task)
-                if (task_position * args.num_trials_per_task + episode_idx) % args.num_shards == args.shard_index
-            ]
+            episode_ids = _episode_ids_for_shard(
+                task_position,
+                args.num_trials_per_task,
+                args.num_shards,
+                args.shard_index,
+            )
             logging.info(f"Shard episode IDs for benchmark task {task_id}: {episode_ids}")
             for episode_idx in tqdm.tqdm(episode_ids):
                 logging.info(f"\nTask: {task_description}")

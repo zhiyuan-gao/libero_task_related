@@ -40,13 +40,19 @@ def targets_from_index(item: dict, mode: str, device: torch.device) -> PolicyAux
             tensor(item["ground_valid_views"], device)[None] if mode == "ground_geometry_semantic_lm" else None
         ),
         semantic_input_ids=(
-            tensor(item["semantic_input_ids"], device)[None] if mode == "ground_geometry_semantic_lm" else None
+            tensor(item["semantic_input_ids"], device)[None]
+            if mode in ("semantic_geometry", "ground_geometry_semantic_lm")
+            else None
         ),
         semantic_labels=(
-            tensor(item["semantic_labels"], device)[None] if mode == "ground_geometry_semantic_lm" else None
+            tensor(item["semantic_labels"], device)[None]
+            if mode in ("semantic_geometry", "ground_geometry_semantic_lm")
+            else None
         ),
         semantic_loss_mask=(
-            tensor(item["semantic_loss_mask"], device)[None] if mode == "ground_geometry_semantic_lm" else None
+            tensor(item["semantic_loss_mask"], device)[None]
+            if mode in ("semantic_geometry", "ground_geometry_semantic_lm")
+            else None
         ),
     )
 
@@ -130,7 +136,7 @@ def main() -> None:
         pytorch_compile_mode=None,
     )
     reports = {}
-    for mode in ("geometry", "ground_geometry_semantic_lm"):
+    for mode in ("geometry", "semantic_geometry", "ground_geometry_semantic_lm"):
         train_config = PolicyAuxTrainConfig(
             mode=mode,
             policy_manifest_path=str(args.policy_manifest),
@@ -138,16 +144,18 @@ def main() -> None:
             geometry_target_index_path=str(args.geometry_index),
             geometry_normalization_path=str(args.geometry_normalization),
             lambda_geo=1.0,
-            lambda_sem=1.0 if mode == "ground_geometry_semantic_lm" else None,
+            lambda_sem=1.0 if mode in ("semantic_geometry", "ground_geometry_semantic_lm") else None,
             lambda_ground=1.0 if mode == "ground_geometry_semantic_lm" else None,
+            num_ground_queries=0 if mode == "semantic_geometry" else 8,
         )
         target_index = PolicyAuxTargetIndex(train_config)
         target_item = target_index.item(0)
         targets = targets_from_index(target_item, mode, device)
         aux_config = PolicyAuxConfig(
             mode=mode,
+            num_ground_queries=0 if mode == "semantic_geometry" else 8,
             lambda_geo=1.0,
-            lambda_sem=1.0 if mode == "ground_geometry_semantic_lm" else None,
+            lambda_sem=1.0 if mode in ("semantic_geometry", "ground_geometry_semantic_lm") else None,
             lambda_ground=1.0 if mode == "ground_geometry_semantic_lm" else None,
         )
         model = PI05AuxPolicy(model_config, aux_config)
@@ -169,7 +177,9 @@ def main() -> None:
         )
         losses = result["losses"]
         loss_order = ["action", "geometry"]
-        if mode == "ground_geometry_semantic_lm":
+        if mode == "semantic_geometry":
+            loss_order.append("semantic")
+        elif mode == "ground_geometry_semantic_lm":
             loss_order.extend(["ground", "semantic"])
         norms = {
             name: gradient_norms(losses[name], parameters, retain_graph=index < len(loss_order) - 1)
@@ -222,6 +232,24 @@ def main() -> None:
                             "action_expert",
                             "action_output",
                         )
+                    ),
+                }
+            )
+        if mode == "semantic_geometry":
+            checks.update(
+                {
+                    "semantic_reaches_only_expected_shared_vlm_path": (
+                        positive(norms["semantic"], "shared_language", "shared_vision")
+                        and zero(
+                            norms["semantic"],
+                            "geometry_queries",
+                            "geometry_head",
+                            "action_expert",
+                            "action_output",
+                        )
+                    ),
+                    "semantic_geometry_has_no_ground_parameters": (
+                        "ground_queries" not in parameters and "ground_head" not in parameters
                     ),
                 }
             )

@@ -27,14 +27,14 @@ def _train_config(mode: str | None):
     if mode is not None:
         policy_aux = SimpleNamespace(
             mode=mode,
-            num_ground_queries=8,
+            num_ground_queries=0 if mode == "semantic_geometry" else 8,
             num_geometry_queries=8,
             ground_mask_dim=256,
             ground_focal_alpha=0.25,
             ground_focal_gamma=2.0,
             lambda_geo=0.15,
             lambda_ground=0.50 if mode == "ground_geometry_semantic_lm" else None,
-            lambda_sem=0.01 if mode == "ground_geometry_semantic_lm" else None,
+            lambda_sem=0.01 if mode in ("semantic_geometry", "ground_geometry_semantic_lm") else None,
             policy_manifest_path="/unusable/semantic-and-grounding",
             geometry_target_index_path="/unusable/geometry",
         )
@@ -56,14 +56,17 @@ def test_shared_factory_selects_plain_or_aux_and_drops_teacher_paths(monkeypatch
 
     plain = create_pytorch_model(_train_config(None))
     p1 = create_pytorch_model(_train_config("geometry"))
+    semantic_geometry = create_pytorch_model(_train_config("semantic_geometry"))
     p2 = create_pytorch_model(_train_config("ground_geometry_semantic_lm"))
 
     assert type(plain) is FakePlain
     assert type(p1) is FakeAux
     assert type(p2) is FakeAux
     assert p1.aux_config.mode == "geometry"
+    assert semantic_geometry.aux_config.mode == "semantic_geometry"
+    assert semantic_geometry.aux_config.num_ground_queries == 0
     assert p2.aux_config.mode == "ground_geometry_semantic_lm"
-    for model in (p1, p2):
+    for model in (p1, semantic_geometry, p2):
         assert model.aux_config.semantic_annotation_root is None
         assert model.aux_config.ground_mask_root is None
         assert model.aux_config.geometry_cache_root is None
@@ -99,6 +102,28 @@ def _p2_layout() -> PrefixLayout:
         geometry=TokenSpan(6, 8),
         ground=TokenSpan(8, 10),
     )
+
+
+def test_semantic_geometry_layout_has_geometry_and_no_ground() -> None:
+    layout = PrefixLayout(
+        view_spans={"agent": TokenSpan(0, 2), "wrist": TokenSpan(2, 4)},
+        real_view_names=("agent", "wrist"),
+        padded_view_names=(),
+        language=TokenSpan(4, 6),
+        context=TokenSpan(0, 6),
+        geometry=TokenSpan(6, 14),
+        ground=None,
+        action_suffix=TokenSpan(14, 17),
+    )
+    prefix_pad = torch.ones((1, 14), dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    suffix_ar = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    mask = build_explicit_aux_train_attention(prefix_pad, suffix_pad, suffix_ar, layout)[0]
+
+    assert layout.query_groups == {"geometry": TokenSpan(6, 14)}
+    assert layout.ground is None
+    assert bool(mask[14:, 6:14].all()) is True
+    assert bool(mask[6:14, 14:].any()) is False
 
 
 def test_explicit_p2_attention_rectangles() -> None:

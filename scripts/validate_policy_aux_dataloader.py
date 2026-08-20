@@ -94,7 +94,7 @@ def main() -> None:
         raise ValueError("Official pi05_libero data config/norm assets were not resolved")
 
     reports = {}
-    for mode in ("geometry", "ground_geometry_semantic_lm"):
+    for mode in ("geometry", "semantic_geometry", "ground_geometry_semantic_lm"):
         aux_config = PolicyAuxTrainConfig(
             mode=mode,
             policy_manifest_path=str(args.policy_manifest.resolve(strict=True)),
@@ -102,9 +102,11 @@ def main() -> None:
             geometry_target_index_path=str(args.geometry_index.resolve(strict=True)),
             geometry_normalization_path=str(args.geometry_normalization.resolve(strict=True)),
             lambda_geo=1.0,
-            lambda_sem=1.0 if mode == "ground_geometry_semantic_lm" else None,
+            lambda_sem=1.0 if mode in ("semantic_geometry", "ground_geometry_semantic_lm") else None,
             lambda_ground=1.0 if mode == "ground_geometry_semantic_lm" else None,
+            num_ground_queries=0 if mode == "semantic_geometry" else 8,
             lerobot_root=str(args.lerobot_root.resolve(strict=True)),
+            lerobot_task_indices=(0, 3, 8) if mode == "semantic_geometry" else None,
         )
         loader = _data_loader.create_torch_data_loader(
             data_config,
@@ -125,6 +127,11 @@ def main() -> None:
                 {
                     "ground_masks",
                     "ground_valid_views",
+                }
+            )
+        if mode in ("semantic_geometry", "ground_geometry_semantic_lm"):
+            expected_keys.update(
+                {
                     "semantic_input_ids",
                     "semantic_labels",
                     "semantic_loss_mask",
@@ -159,6 +166,11 @@ def main() -> None:
                         list(mask.shape) == [2, 128, 128] for mask in targets["ground_masks"].values()
                     ),
                     "ground_valid_view_shape": list(targets["ground_valid_views"].shape) == [2, 2],
+                }
+            )
+        if mode in ("semantic_geometry", "ground_geometry_semantic_lm"):
+            checks.update(
+                {
                     "semantic_fixed_teacher_shapes": (
                         list(targets["semantic_input_ids"].shape) == [2, 31]
                         and list(targets["semantic_labels"].shape) == [2, 32]
@@ -172,6 +184,26 @@ def main() -> None:
                         .eq(1)
                         .any(dim=1)
                         .all()
+                    ),
+                }
+            )
+        if mode == "semantic_geometry":
+            selected_records = [
+                row
+                for row in json.loads(args.mapping.read_text())["episodes"]
+                if int(row["lerobot_task_index"]) in {0, 3, 8}
+            ]
+            checks.update(
+                {
+                    "no_ground_targets_loaded": (
+                        "ground_masks" not in targets and "ground_valid_views" not in targets
+                    ),
+                    "exact_three_task_episode_population": len(selected_records) == 114,
+                    "exact_three_task_frame_population": (
+                        sum(int(row["episode_length"]) for row in selected_records) == 29_250
+                    ),
+                    "exact_three_task_indices": (
+                        {int(row["lerobot_task_index"]) for row in selected_records} == {0, 3, 8}
                     ),
                 }
             )

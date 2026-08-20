@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -80,6 +81,67 @@ def test_p1_approved_config_requires_geometry_lambda() -> None:
         )
 
 
+def test_semantic_geometry_requires_semantic_lambda_and_zero_ground_queries() -> None:
+    common = {
+        "mode": "semantic_geometry",
+        "policy_manifest_path": "manifest.parquet",
+        "episode_mapping_path": "mapping.json",
+        "geometry_target_index_path": "target_index.parquet",
+        "geometry_normalization_path": "train_mean_std.json",
+        "lambda_geo": 0.15,
+        "num_ground_queries": 0,
+    }
+    with pytest.raises(ValueError, match="required loss coefficient"):
+        PolicyAuxTrainConfig(**common, loss_coefficients_approved=True)
+    config = PolicyAuxTrainConfig(
+        **common,
+        lambda_sem=0.01,
+        loss_coefficients_approved=True,
+    )
+    assert config.lambda_ground is None
+    assert config.num_geometry_queries == 8
+
+
+def test_semantic_geometry_target_join_never_loads_ground_masks() -> None:
+    class FakeAnnotations:
+        def row(self, episode_index: int, frame_index: int):
+            assert (episode_index, frame_index) == (7, 3)
+            return {"sample_id": "sample-7-3", "semantic_subtask": "pick up the white mug"}
+
+        def load_upright_ground_masks(self, _row):
+            raise AssertionError("Semantic+Geometry must not load Ground masks")
+
+    class FakeGeometry:
+        mean = np.zeros((2048,), dtype=np.float32)
+        std = np.ones((2048,), dtype=np.float32)
+
+        def target_by_dataset_index(self, dataset_index: int):
+            assert dataset_index == 11
+            return np.ones((2048,), dtype=np.float32), True, "sample-7-3"
+
+    target_index = _policy_aux_dataset.PolicyAuxTargetIndex.__new__(
+        _policy_aux_dataset.PolicyAuxTargetIndex
+    )
+    target_index.config = SimpleNamespace(mode="semantic_geometry")
+    target_index.annotations = FakeAnnotations()
+    target_index.geometry = FakeGeometry()
+    target_index.semantic_tokenizer = PolicySemanticTokenizer(max_target_len=16)
+    target_index._dataset_identity = {11: (7, 3)}  # noqa: SLF001
+
+    item = target_index.item(11)
+    assert "ground_masks" not in item
+    assert "ground_valid_views" not in item
+    assert set(item) == {
+        "geometry",
+        "geometry_valid",
+        "geometry_mean",
+        "geometry_std",
+        "semantic_input_ids",
+        "semantic_labels",
+        "semantic_loss_mask",
+    }
+
+
 def test_primary_train_configs_reject_lambda_or_architecture_override() -> None:
     p1 = _config.get_config("pi05_libero_p1_aux")
     p2 = _config.get_config("pi05_libero_p2_aux")
@@ -104,6 +166,7 @@ def test_primary_train_configs_reject_lambda_or_architecture_override() -> None:
 def test_libero3_pilot_configs_are_frozen_and_matched() -> None:
     p1 = _config.get_config("pi05_libero3_p1_aux")
     p2 = _config.get_config("pi05_libero3_p2_aux")
+    semantic_geometry = _config.get_config("pi05_libero3_semantic_geometry_aux")
 
     assert p1.policy_aux.lerobot_task_indices == (0, 3, 8)
     assert p2.policy_aux.lerobot_task_indices == (0, 3, 8)
@@ -112,6 +175,18 @@ def test_libero3_pilot_configs_are_frozen_and_matched() -> None:
     assert p1.batch_size == p2.batch_size == 256
     assert p1.gradient_accumulation_steps == p2.gradient_accumulation_steps == 1
     assert p1.pytorch_weight_path == p2.pytorch_weight_path
+    assert semantic_geometry.policy_aux.mode == "semantic_geometry"
+    assert semantic_geometry.policy_aux.lerobot_task_indices == (0, 3, 8)
+    assert semantic_geometry.policy_aux.num_ground_queries == 0
+    assert semantic_geometry.policy_aux.lambda_geo == 0.15
+    assert semantic_geometry.policy_aux.lambda_sem == 0.01
+    assert semantic_geometry.policy_aux.lambda_ground is None
+    assert semantic_geometry.ema_decay is None
+    assert semantic_geometry.num_train_steps == 3_209
+    assert semantic_geometry.lr_schedule.warmup_steps == 1_069
+    assert semantic_geometry.batch_size == 256
+    assert semantic_geometry.gradient_accumulation_steps == 1
+    assert semantic_geometry.pytorch_weight_path == p1.pytorch_weight_path
 
     with pytest.raises(ValueError, match="only approved reduced pilot population"):
         dataclasses.replace(p1.policy_aux, lerobot_task_indices=(0, 1, 2))
