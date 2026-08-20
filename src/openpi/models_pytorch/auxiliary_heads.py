@@ -85,6 +85,37 @@ def masked_standardized_mse(
     return F.mse_loss(standardized_prediction[valid], standardized_target[valid])
 
 
+def masked_standardized_smooth_l1(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    *,
+    beta: float = 1.0,
+) -> torch.Tensor:
+    """Train-standardized Smooth-L1 averaged over valid samples and dimensions."""
+
+    if prediction.shape != target.shape:
+        raise ValueError(f"Prediction/target shapes differ: {prediction.shape} vs {target.shape}")
+    if prediction.ndim != 2:
+        raise ValueError("Motion tensors must have shape [B,D]")
+    valid = valid.to(device=prediction.device, dtype=torch.bool)
+    if valid.shape != prediction.shape[:1]:
+        raise ValueError("Motion valid mask must have shape [B]")
+    if beta <= 0:
+        raise ValueError("Motion Smooth-L1 beta must be positive")
+    if not bool(valid.any()):
+        return prediction.sum() * 0.0
+    safe_std = std.to(device=prediction.device, dtype=torch.float32)
+    if not bool(torch.all(safe_std > 0)):
+        raise ValueError("Motion standard deviations must be positive")
+    center = mean.to(device=prediction.device, dtype=torch.float32)
+    standardized_prediction = (prediction.float() - center) / safe_std
+    standardized_target = (target.float() - center) / safe_std
+    return F.smooth_l1_loss(standardized_prediction[valid], standardized_target[valid], beta=beta)
+
+
 def grounding_focal_dice_loss(
     logits: torch.Tensor,
     target_coverage: torch.Tensor,

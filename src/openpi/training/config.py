@@ -576,6 +576,7 @@ class TrainConfig:
                 "lambda_geo": 0.15,
                 "lambda_ground": None,
                 "lambda_sem": None,
+                "lambda_motion": None,
                 "diagnostic_skip_semantic_lm": False,
             },
             "pi05_libero_p2_aux": {
@@ -583,6 +584,7 @@ class TrainConfig:
                 "lambda_geo": 0.15,
                 "lambda_ground": 0.50,
                 "lambda_sem": 0.01,
+                "lambda_motion": None,
                 "diagnostic_skip_semantic_lm": False,
             },
             "pi05_libero3_p1_aux": {
@@ -590,6 +592,7 @@ class TrainConfig:
                 "lambda_geo": 0.15,
                 "lambda_ground": None,
                 "lambda_sem": None,
+                "lambda_motion": None,
                 "diagnostic_skip_semantic_lm": False,
             },
             "pi05_libero3_p2_aux": {
@@ -597,6 +600,7 @@ class TrainConfig:
                 "lambda_geo": 0.15,
                 "lambda_ground": 0.50,
                 "lambda_sem": 0.01,
+                "lambda_motion": None,
                 "diagnostic_skip_semantic_lm": False,
             },
             "pi05_libero3_semantic_geometry_aux": {
@@ -604,6 +608,15 @@ class TrainConfig:
                 "lambda_geo": 0.15,
                 "lambda_ground": None,
                 "lambda_sem": 0.01,
+                "lambda_motion": None,
+                "diagnostic_skip_semantic_lm": False,
+            },
+            "pi05_libero3_semantic_geometry_motion_aux": {
+                "mode": "semantic_geometry_motion",
+                "lambda_geo": 0.15,
+                "lambda_ground": None,
+                "lambda_sem": 0.01,
+                "lambda_motion": 0.10,
                 "diagnostic_skip_semantic_lm": False,
             },
         }
@@ -615,6 +628,7 @@ class TrainConfig:
                 "lambda_geo": self.policy_aux.lambda_geo,
                 "lambda_ground": self.policy_aux.lambda_ground,
                 "lambda_sem": self.policy_aux.lambda_sem,
+                "lambda_motion": self.policy_aux.lambda_motion,
                 "diagnostic_skip_semantic_lm": self.policy_aux.diagnostic_skip_semantic_lm,
             }
             if observed != expected:
@@ -1057,6 +1071,51 @@ _CONFIGS = [
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
         # Every scheduled full-run checkpoint (1000/2000/3000) is retained.
+        keep_period=1000,
+    ),
+    # B: the current Ground-free A protocol plus an isolated Motion query group.
+    TrainConfig(
+        name="pi05_libero3_semantic_geometry_motion_aux",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        policy_aux=_policy_aux_dataset.PolicyAuxTrainConfig(
+            mode="semantic_geometry_motion",
+            policy_manifest_path=f"{_POLICY_AUX_ROOT}/manifests/libero10_policy_aux_manifest.parquet",
+            episode_mapping_path=f"{_POLICY_AUX_ROOT}/debug/lerobot_episode_mapping.json",
+            geometry_target_index_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/target_index.parquet",
+            geometry_normalization_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/normalization/train_mean_std.json",
+            motion_target_index_path=(f"{_POLICY_AUX_ROOT}/motion_libero10_tasks_0_3_8_v1/index.parquet"),
+            motion_normalization_path=(
+                f"{_POLICY_AUX_ROOT}/motion_libero10_tasks_0_3_8_v1/target_statistics_train.json"
+            ),
+            lambda_sem=0.01,
+            lambda_geo=0.15,
+            lambda_motion=0.10,
+            num_ground_queries=0,
+            num_motion_queries=8,
+            lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+            lerobot_task_indices=_policy_aux_dataset.LIBERO3_PILOT_TASK_INDICES,
+            loss_coefficients_approved=True,
+        ),
+        batch_size=256,
+        gradient_accumulation_steps=1,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=_POLICY_AUX_LIBERO3_WARMUP_STEPS,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
+        num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
         keep_period=1000,
     ),
     TrainConfig(

@@ -102,6 +102,26 @@ def test_semantic_geometry_requires_semantic_lambda_and_zero_ground_queries() ->
     assert config.num_geometry_queries == 8
 
 
+def test_b_requires_motion_paths_lambda_and_eight_queries() -> None:
+    common = {
+        "mode": "semantic_geometry_motion",
+        "policy_manifest_path": "manifest.parquet",
+        "episode_mapping_path": "mapping.json",
+        "geometry_target_index_path": "geometry.parquet",
+        "geometry_normalization_path": "geometry_stats.json",
+        "motion_target_index_path": "motion.parquet",
+        "motion_normalization_path": "motion_stats.json",
+        "lambda_geo": 0.15,
+        "lambda_sem": 0.01,
+        "num_ground_queries": 0,
+        "num_motion_queries": 8,
+    }
+    with pytest.raises(ValueError, match="required loss coefficient"):
+        PolicyAuxTrainConfig(**common, loss_coefficients_approved=True)
+    config = PolicyAuxTrainConfig(**common, lambda_motion=0.10, loss_coefficients_approved=True)
+    assert config.lambda_motion == 0.10
+
+
 def test_semantic_geometry_target_join_never_loads_ground_masks() -> None:
     class FakeAnnotations:
         def row(self, episode_index: int, frame_index: int):
@@ -119,9 +139,7 @@ def test_semantic_geometry_target_join_never_loads_ground_masks() -> None:
             assert dataset_index == 11
             return np.ones((2048,), dtype=np.float32), True, "sample-7-3"
 
-    target_index = _policy_aux_dataset.PolicyAuxTargetIndex.__new__(
-        _policy_aux_dataset.PolicyAuxTargetIndex
-    )
+    target_index = _policy_aux_dataset.PolicyAuxTargetIndex.__new__(_policy_aux_dataset.PolicyAuxTargetIndex)
     target_index.config = SimpleNamespace(mode="semantic_geometry")
     target_index.annotations = FakeAnnotations()
     target_index.geometry = FakeGeometry()
@@ -167,6 +185,7 @@ def test_libero3_pilot_configs_are_frozen_and_matched() -> None:
     p1 = _config.get_config("pi05_libero3_p1_aux")
     p2 = _config.get_config("pi05_libero3_p2_aux")
     semantic_geometry = _config.get_config("pi05_libero3_semantic_geometry_aux")
+    b = _config.get_config("pi05_libero3_semantic_geometry_motion_aux")
 
     assert p1.policy_aux.lerobot_task_indices == (0, 3, 8)
     assert p2.policy_aux.lerobot_task_indices == (0, 3, 8)
@@ -187,6 +206,15 @@ def test_libero3_pilot_configs_are_frozen_and_matched() -> None:
     assert semantic_geometry.batch_size == 256
     assert semantic_geometry.gradient_accumulation_steps == 1
     assert semantic_geometry.pytorch_weight_path == p1.pytorch_weight_path
+    assert b.policy_aux.mode == "semantic_geometry_motion"
+    assert b.policy_aux.num_ground_queries == 0
+    assert b.policy_aux.num_motion_queries == 8
+    assert b.policy_aux.lambda_motion == 0.10
+    assert b.policy_aux.lambda_geo == semantic_geometry.policy_aux.lambda_geo
+    assert b.policy_aux.lambda_sem == semantic_geometry.policy_aux.lambda_sem
+    assert b.ema_decay is None
+    assert b.num_train_steps == semantic_geometry.num_train_steps
+    assert b.pytorch_weight_path == semantic_geometry.pytorch_weight_path
 
     with pytest.raises(ValueError, match="only approved reduced pilot population"):
         dataclasses.replace(p1.policy_aux, lerobot_task_indices=(0, 1, 2))
