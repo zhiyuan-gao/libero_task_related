@@ -19,7 +19,7 @@ readonly accumulation_steps=1
 readonly total_updates=3209
 readonly lambda_geo=0.15
 readonly lambda_sem=0.01
-readonly lambda_motion=0.10
+readonly lambda_motion=0.05
 
 export OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=1
 export OPENPI_LOG_MEMORY_STATS=0
@@ -37,9 +37,11 @@ fi
 
 "$openpi_python" - <<'PY'
 import hashlib
+import json
 from pathlib import Path
 
 from openpi.training import config
+from openpi.training.policy_aux_dataset import MotionPolicyTargetIndex
 from safetensors import safe_open
 
 cfg = config.get_config("pi05_libero3_semantic_geometry_motion_aux")
@@ -47,10 +49,21 @@ aux = cfg.policy_aux
 assert cfg.ema_decay is None
 assert aux.mode == "semantic_geometry_motion"
 assert aux.num_ground_queries == 0 and aux.num_motion_queries == 8
-assert aux.lambda_geo == 0.15 and aux.lambda_sem == 0.01 and aux.lambda_motion == 0.10
+assert aux.lambda_geo == 0.15 and aux.lambda_sem == 0.01 and aux.lambda_motion == 0.05
 assert aux.lambda_ground is None and aux.lerobot_task_indices == (0, 3, 8)
 assert cfg.batch_size == 256 and cfg.gradient_accumulation_steps == 1
 assert cfg.num_train_steps == 3209 and cfg.lr_schedule.warmup_steps == 1069
+motion_index = Path(aux.motion_target_index_path).resolve(strict=True)
+motion_root = motion_index.parent
+validation = json.loads((motion_root / "cache_validation.json").read_text())
+assert validation["selected_samples"] == 28_110
+assert validation["shape"] == [28_110, 256]
+assert validation["dtype"] == "float32"
+assert validation["all_finite"] and validation["no_missing_targets"] and validation["sample_ids_unique"]
+assert validation["pilot_overlap"]["exact_equal"] and validation["pilot_overlap"]["max_abs"] == 0.0
+index_digest = hashlib.sha256(motion_index.read_bytes()).hexdigest()
+assert index_digest == validation["index_sha256"] == "887a65bc8cbccb8d3ea6792999163a3db2eb1eda8c68b549f7eb0436c399c623"
+MotionPolicyTargetIndex(motion_index, aux.motion_normalization_path)
 checkpoint = Path(cfg.pytorch_weight_path) / "model.safetensors"
 assert checkpoint.stat().st_size == 14_467_165_872
 with safe_open(checkpoint, framework="pt", device="cpu") as handle:
@@ -63,6 +76,7 @@ with checkpoint.open("rb") as handle:
         digest.update(chunk)
 assert digest.hexdigest() == "4f5facee8d0897bcc95900929e2cdb978a4cebd63651d80155444d4c086c23ee"
 print("SEMANTIC_GEOMETRY_MOTION_CONFIG_GATE=PASS")
+print("MOTION_CACHE_GATE=PASS")
 print("STRICT_FP32_BASE_GATE=PASS")
 PY
 

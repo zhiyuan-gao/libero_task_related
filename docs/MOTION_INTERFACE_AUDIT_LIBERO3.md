@@ -1,7 +1,7 @@
 # Motion interface audit for LIBERO-10 tasks 0/3/8
 
 Audit date: 2026-08-20 UTC  
-Status: data artifact validated; experiment B implementation and training blocked pending explicit approval
+Status: interface approved and implemented; formal training remains blocked pending final researcher confirmation
 
 ## Audited artifacts
 
@@ -25,19 +25,18 @@ Status: data artifact validated; experiment B implementation and training blocke
 | Temporal alignment | The target is anchored at current policy frame `t`, but is computed after observing real frames through `t+10`. The policy action horizon is 10. Thus the target supervises the same frame anchor as the action chunk while summarizing a future-inclusive 11-frame visual window. |
 | Padding and validity | There is no padded or fabricated zero target. The final 10 frames of every one of the 114 episodes are invalid because a full `t:t+10` clip is unavailable. These 1,140 rows remain in the policy manifest with `motion_valid=false` and must contribute exactly zero Motion loss. Only the 28,110 valid targets are stored in the target shards/index. |
 | Normalization | Per-dimension mean and population standard deviation were computed over exactly the 28,110 three-task, train-split, valid targets. Accumulation is float64; stored target dtype is FP32; the handoff specifies a `1e-6` standard-deviation floor. Statistics are in `target_statistics_train.json`. |
-| Future information | The teacher target intrinsically contains future visual information because Track4World consumes `t+1:t+10`. This is permissible only as an auxiliary training target. It would be leakage if future frames, the target, mask, stage label, or teacher internals entered the policy/action input. No experiment-B DataLoader/model path has yet been implemented, so teacher isolation has not yet passed the required no-leakage gate. |
-| Motion query/head in action prefix | Not approved. The handoff proposes, but explicitly does not freeze, eight Motion queries, a per-query LayerNorm followed by query mean and `Linear(2048,256)`, and an action-readable Motion span. Whether Motion enters the action prefix and its attention topology remain human decisions. |
-| Loss and reduction | Not approved for experiment B. The probe used standardized `SmoothL1Loss(beta=1, reduction=mean)` as a possible starting point, but the handoff labels it a candidate rather than a frozen policy-training definition. Masked reduction behavior for mixed valid/invalid policy batches must also be approved and tested. |
-| `lambda_motion` | No value or approval record exists. The standalone probe has no `lambda_motion`, so no coefficient can legitimately be copied from it. |
-| Teacher-free inference | Required design intent: yes. Current A inference is teacher-free. B cannot claim this property until its approved interface is implemented and the serving/no-leakage gates pass. |
+| Future information | The teacher target intrinsically contains future visual information because Track4World consumes `t+1:t+10`. It enters only the loss target. Motion queries are learned parameters, and neither future frames nor Motion targets enter the policy forward input. Joint-mask tests verify that SemanticTeacher is hidden from Action, Geometry, and Motion. |
+| Motion query/head in action prefix | Approved and implemented as eight Motion queries followed by per-query LayerNorm, query mean, and `Linear(2048,256)`. Motion reads Context plus itself; Geometry and Motion cannot read each other; Action reads both. The prefix order is `Context|Geometry|Motion|SemanticTeacher`, with Action as the separate expert suffix. |
+| Loss and reduction | Approved and implemented as train-standardized `SmoothL1Loss(beta=1, reduction=mean)` over valid samples and all 256 dimensions. Invalid samples are excluded; an all-invalid batch returns a differentiable exact zero. Static and moving valid samples have equal weight. |
+| `lambda_motion` | Researcher-confirmed at `0.05` on 2026-08-20 after reviewing a 32-sample real-data initial raw Motion loss of 2.614148. The corresponding initial weighted contribution is 0.130707. |
+| Teacher-free inference | Yes. Inference appends only learned Geometry and Motion queries and never accepts Semantic or Motion teacher targets. |
 
 ## Decision
 
-Experiment B (`Semantic + Geometry + Motion`) must stop before implementation and training. The existing artifact is sufficient to define the Motion teacher target, identity join, validity, and normalization, but it does **not** approve:
-
-1. the Motion query count, head, prefix position, or attention topology;
-2. the Motion loss and masked reduction;
-3. `lambda_motion`;
-4. whether static/moving samples receive equal or stratified weighting.
-
-Explicit approval of those items is required before adding a `semantic_geometry_motion` mode, running its gates, or launching its 8-GPU preflight. Experiment B must initialize independently from the same official pi05 base as experiment A; it must never initialize from A.
+Experiment B is frozen as the current experiment A implementation—P2 joint-masked
+Semantic and Geometry with Grounding completely removed—plus the isolated Motion
+branch above. A and B use the same data population, optimizer schedule, strict
+FP32-converted base, BF16 training precision, global batch 256, 3,209 updates,
+and RAW/no-EMA checkpoints. B initializes independently from the same base as A;
+it never initializes from A's trained checkpoint. Formal A/B training remains
+blocked until the researcher gives the requested final confirmation.

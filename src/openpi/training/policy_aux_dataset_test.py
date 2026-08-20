@@ -118,8 +118,8 @@ def test_b_requires_motion_paths_lambda_and_eight_queries() -> None:
     }
     with pytest.raises(ValueError, match="required loss coefficient"):
         PolicyAuxTrainConfig(**common, loss_coefficients_approved=True)
-    config = PolicyAuxTrainConfig(**common, lambda_motion=0.10, loss_coefficients_approved=True)
-    assert config.lambda_motion == 0.10
+    config = PolicyAuxTrainConfig(**common, lambda_motion=0.05, loss_coefficients_approved=True)
+    assert config.lambda_motion == 0.05
 
 
 def test_semantic_geometry_target_join_never_loads_ground_masks() -> None:
@@ -209,7 +209,7 @@ def test_libero3_pilot_configs_are_frozen_and_matched() -> None:
     assert b.policy_aux.mode == "semantic_geometry_motion"
     assert b.policy_aux.num_ground_queries == 0
     assert b.policy_aux.num_motion_queries == 8
-    assert b.policy_aux.lambda_motion == 0.10
+    assert b.policy_aux.lambda_motion == 0.05
     assert b.policy_aux.lambda_geo == semantic_geometry.policy_aux.lambda_geo
     assert b.policy_aux.lambda_sem == semantic_geometry.policy_aux.lambda_sem
     assert b.ema_decay is None

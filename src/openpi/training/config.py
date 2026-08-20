@@ -616,7 +616,7 @@ class TrainConfig:
                 "lambda_geo": 0.15,
                 "lambda_ground": None,
                 "lambda_sem": 0.01,
-                "lambda_motion": 0.10,
+                "lambda_motion": 0.05,
                 "diagnostic_skip_semantic_lm": False,
             },
         }
@@ -1095,7 +1095,7 @@ _CONFIGS = [
             ),
             lambda_sem=0.01,
             lambda_geo=0.15,
-            lambda_motion=0.10,
+            lambda_motion=0.05,
             num_ground_queries=0,
             num_motion_queries=8,
             lerobot_root=_POLICY_AUX_LEROBOT_ROOT,

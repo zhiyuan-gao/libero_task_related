@@ -39,7 +39,7 @@ def _train_config(mode: str | None):
             lambda_sem=0.01
             if mode in ("semantic_geometry", "semantic_geometry_motion", "ground_geometry_semantic_lm")
             else None,
-            lambda_motion=0.10 if mode == "semantic_geometry_motion" else None,
+            lambda_motion=0.05 if mode == "semantic_geometry_motion" else None,
             policy_manifest_path="/unusable/semantic-and-grounding",
             geometry_target_index_path="/unusable/geometry",
         )
@@ -157,6 +157,45 @@ def test_b_motion_queries_are_isolated_and_visible_to_action() -> None:
     assert not bool(mask[4:12, 12:20].any())
     assert not bool(mask[12:20, 4:12].any())
     assert bool(mask[20:, :20].all())
+
+
+def test_b_joint_mask_hides_semantic_teacher_from_motion_and_action() -> None:
+    base_layout = PrefixLayout(
+        view_spans={"agent": TokenSpan(0, 2)},
+        real_view_names=("agent",),
+        padded_view_names=(),
+        language=TokenSpan(2, 4),
+        context=TokenSpan(0, 4),
+        geometry=TokenSpan(4, 6),
+        ground=None,
+        motion=TokenSpan(6, 8),
+    )
+    layout = JointP2TrainLayout(
+        base_layout=base_layout,
+        semantic=TokenSpan(8, 11),
+        action_suffix=TokenSpan(11, 14),
+    )
+    prefix_pad = torch.ones((1, 11), dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    suffix_ar = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    mask = build_joint_p2_attention(prefix_pad, suffix_pad, suffix_ar, layout)[0]
+
+    # Geometry and Motion each read only Context plus their own query group.
+    assert bool(mask[4:6, :4].all())
+    assert bool(mask[4:6, 4:6].all())
+    assert not bool(mask[4:6, 6:11].any())
+    assert bool(mask[6:8, :4].all())
+    assert bool(mask[6:8, 6:8].all())
+    assert not bool(mask[6:8, 4:6].any())
+    assert not bool(mask[6:8, 8:11].any())
+
+    # Semantic sees Context and its causal teacher prefix, never either query group.
+    assert bool(mask[8:11, :4].all())
+    assert not bool(mask[8:11, 4:8].any())
+
+    # Action reads Context, Geometry, and Motion, but never SemanticTeacher.
+    assert bool(mask[11:14, :8].all())
+    assert not bool(mask[11:14, 8:11].any())
 
 
 def test_motion_smooth_l1_masks_invalid_samples_exactly() -> None:
