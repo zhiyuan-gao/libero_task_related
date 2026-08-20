@@ -122,6 +122,35 @@ def test_b_requires_motion_paths_lambda_and_eight_queries() -> None:
     assert config.lambda_motion == 0.05
 
 
+def test_p3_requires_binary_fixed_balanced_ground_objective_and_weight() -> None:
+    common = {
+        "mode": "semantic_geometry_motion_binary_ground",
+        "policy_manifest_path": "manifest.parquet",
+        "episode_mapping_path": "mapping.json",
+        "geometry_target_index_path": "geometry.parquet",
+        "geometry_normalization_path": "geometry_stats.json",
+        "motion_target_index_path": "motion.parquet",
+        "motion_normalization_path": "motion_stats.json",
+        "lambda_geo": 0.15,
+        "lambda_sem": 0.01,
+        "lambda_motion": 0.05,
+        "lambda_ground": 0.05,
+        "num_ground_queries": 8,
+        "num_motion_queries": 8,
+        "loss_coefficients_approved": True,
+    }
+    with pytest.raises(ValueError, match="binary_fixed_balanced_bce"):
+        PolicyAuxTrainConfig(**common)
+    with pytest.raises(ValueError, match="positive weight"):
+        PolicyAuxTrainConfig(**common, ground_objective="binary_fixed_balanced_bce")
+    p3 = PolicyAuxTrainConfig(
+        **common,
+        ground_objective="binary_fixed_balanced_bce",
+        ground_positive_weight=5.9399674343,
+    )
+    assert p3.ground_positive_weight == 5.9399674343
+
+
 def test_semantic_geometry_target_join_never_loads_ground_masks() -> None:
     class FakeAnnotations:
         def row(self, episode_index: int, frame_index: int):
@@ -186,6 +215,7 @@ def test_libero3_pilot_configs_are_frozen_and_matched() -> None:
     p2 = _config.get_config("pi05_libero3_p2_aux")
     semantic_geometry = _config.get_config("pi05_libero3_semantic_geometry_aux")
     b = _config.get_config("pi05_libero3_semantic_geometry_motion_aux")
+    p3 = _config.get_config("pi05_libero3_p3_binary_ground_aux")
 
     assert p1.policy_aux.lerobot_task_indices == (0, 3, 8)
     assert p2.policy_aux.lerobot_task_indices == (0, 3, 8)
@@ -215,6 +245,23 @@ def test_libero3_pilot_configs_are_frozen_and_matched() -> None:
     assert b.ema_decay is None
     assert b.num_train_steps == semantic_geometry.num_train_steps
     assert b.pytorch_weight_path == semantic_geometry.pytorch_weight_path
+    assert p3.policy_aux.mode == "semantic_geometry_motion_binary_ground"
+    assert p3.policy_aux.ground_objective == "binary_fixed_balanced_bce"
+    assert p3.policy_aux.ground_positive_weight == 5.9399674343
+    assert p3.policy_aux.num_ground_queries == 8
+    assert p3.policy_aux.num_motion_queries == 8
+    assert p3.policy_aux.lambda_ground == 0.05
+    assert p3.policy_aux.lambda_geo == b.policy_aux.lambda_geo == 0.15
+    assert p3.policy_aux.lambda_sem == b.policy_aux.lambda_sem == 0.01
+    assert p3.policy_aux.lambda_motion == b.policy_aux.lambda_motion == 0.05
+    assert p3.policy_aux.lerobot_task_indices == (0, 3, 8)
+    assert p3.num_train_steps == 3_209
+    assert p3.lr_schedule.warmup_steps == 1_069
+    assert p3.batch_size == 256
+    assert p3.gradient_accumulation_steps == 1
+    assert p3.ema_decay is None
+    assert p3.pytorch_weight_path == b.pytorch_weight_path
+    assert p3.checkpoint_keep_steps == (500, 1_000, 2_000, 3_209)
 
     with pytest.raises(ValueError, match="only approved reduced pilot population"):
         dataclasses.replace(p1.policy_aux, lerobot_task_indices=(0, 1, 2))

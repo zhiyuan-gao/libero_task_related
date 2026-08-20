@@ -208,8 +208,10 @@ def should_save_checkpoint(global_step: int, config: _config.TrainConfig) -> boo
 
 
 _RESUME_RUNTIME_FIELDS = {
+    "checkpoint_keep_steps",
     "keep_period",
     "log_interval",
+    "max_checkpoints_to_keep",
     "num_train_steps",
     "overwrite",
     "resume",
@@ -226,8 +228,14 @@ def trajectory_config(config: _config.TrainConfig | dict) -> dict:
     return {key: value for key, value in payload.items() if key not in _RESUME_RUNTIME_FIELDS}
 
 
-def prune_checkpoints(checkpoint_dir, *, keep_period: int | None) -> list[int]:
-    """Keep protected periodic checkpoints and at most the latest ordinary checkpoint."""
+def prune_checkpoints(
+    checkpoint_dir,
+    *,
+    keep_period: int | None,
+    keep_steps: tuple[int, ...] = (),
+    max_to_keep: int | None = None,
+) -> list[int]:
+    """Prune checkpoints while honoring periodic, exact, and rolling retention."""
 
     checkpoints = sorted(
         (int(path.name), path) for path in checkpoint_dir.iterdir() if path.is_dir() and path.name.isdigit()
@@ -235,10 +243,12 @@ def prune_checkpoints(checkpoint_dir, *, keep_period: int | None) -> list[int]:
     if not checkpoints:
         return []
     latest_step = checkpoints[-1][0]
+    explicit = set(keep_steps)
+    rolling = {step for step, _ in checkpoints[-max_to_keep:]} if max_to_keep is not None else {latest_step}
     removed = []
     for step, path in checkpoints:
-        protected = keep_period is not None and step % keep_period == 0
-        if step != latest_step and not protected:
+        protected = (keep_period is not None and step % keep_period == 0) or step in explicit
+        if step not in rolling and not protected:
             shutil.rmtree(path)
             removed.append(step)
     return removed
@@ -340,7 +350,12 @@ def save_checkpoint(
         raise FileExistsError(f"Refusing to replace an already-published checkpoint: {final_ckpt_dir}")
     tmp_ckpt_dir.rename(final_ckpt_dir)
 
-    removed = prune_checkpoints(config.checkpoint_dir, keep_period=config.keep_period)
+    removed = prune_checkpoints(
+        config.checkpoint_dir,
+        keep_period=config.keep_period,
+        keep_steps=config.checkpoint_keep_steps,
+        max_to_keep=config.max_checkpoints_to_keep,
+    )
     if removed:
         logging.info(f"Pruned superseded ordinary checkpoints: {removed}")
 

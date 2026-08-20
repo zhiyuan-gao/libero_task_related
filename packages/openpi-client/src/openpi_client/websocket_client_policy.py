@@ -15,7 +15,15 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
     See WebsocketPolicyServer for a corresponding server implementation.
     """
 
-    def __init__(self, host: str = "0.0.0.0", port: Optional[int] = None, api_key: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: Optional[int] = None,
+        api_key: Optional[str] = None,
+        *,
+        ping_interval: Optional[float] = 20,
+        ping_timeout: Optional[float] = 20,
+    ) -> None:
         if host.startswith("ws"):
             self._uri = host
         else:
@@ -24,6 +32,8 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             self._uri += f":{port}"
         self._packer = msgpack_numpy.Packer()
         self._api_key = api_key
+        self._ping_interval = ping_interval
+        self._ping_timeout = ping_timeout
         self._ws, self._server_metadata = self._wait_for_server()
 
     def get_server_metadata(self) -> Dict:
@@ -35,7 +45,12 @@ class WebsocketClientPolicy(_base_policy.BasePolicy):
             try:
                 headers = {"Authorization": f"Api-Key {self._api_key}"} if self._api_key else None
                 conn = websockets.sync.client.connect(
-                    self._uri, compression=None, max_size=None, additional_headers=headers
+                    self._uri,
+                    compression=None,
+                    max_size=None,
+                    additional_headers=headers,
+                    ping_interval=self._ping_interval,
+                    ping_timeout=self._ping_timeout,
                 )
                 metadata = msgpack_numpy.unpackb(conn.recv())
                 return conn, metadata

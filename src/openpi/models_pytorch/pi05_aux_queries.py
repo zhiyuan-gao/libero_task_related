@@ -24,6 +24,7 @@ import torch.nn.functional as F  # noqa: N812
 
 from openpi.models_pytorch.auxiliary_heads import MeanQueryProjectionHead
 from openpi.models_pytorch.auxiliary_heads import QueryConditionedPatchMaskHead
+from openpi.models_pytorch.auxiliary_heads import grounding_fixed_balanced_binary_bce_loss
 from openpi.models_pytorch.auxiliary_heads import grounding_focal_dice_loss
 from openpi.models_pytorch.auxiliary_heads import masked_standardized_mse
 from openpi.models_pytorch.auxiliary_heads import masked_standardized_smooth_l1
@@ -34,7 +35,12 @@ from openpi.models_pytorch.policy_aux_preprocessing import preprocess_observatio
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 PolicyAuxMode = Literal[
-    "none", "geometry", "semantic_geometry", "semantic_geometry_motion", "ground_geometry_semantic_lm"
+    "none",
+    "geometry",
+    "semantic_geometry",
+    "semantic_geometry_motion",
+    "ground_geometry_semantic_lm",
+    "semantic_geometry_motion_binary_ground",
 ]
 SemanticImplementation = Literal["two_pass_reference", "joint_masked"]
 
@@ -60,6 +66,8 @@ class PolicyAuxConfig:
     ground_mask_dim: int = 256
     ground_focal_alpha: float = 0.25
     ground_focal_gamma: float = 2.0
+    ground_objective: Literal["coverage_focal_dice", "binary_fixed_balanced_bce"] = "coverage_focal_dice"
+    ground_positive_weight: float | None = None
     lambda_sem: float | None = None
     lambda_ground: float | None = None
     lambda_geo: float | None = None
@@ -77,6 +85,7 @@ class PolicyAuxConfig:
             "semantic_geometry",
             "semantic_geometry_motion",
             "ground_geometry_semantic_lm",
+            "semantic_geometry_motion_binary_ground",
         ):
             raise ValueError(f"Unsupported policy_aux_mode: {self.mode}")
         if self.diagnostic_skip_semantic_lm and self.mode != "ground_geometry_semantic_lm":
@@ -90,13 +99,24 @@ class PolicyAuxConfig:
             )
         if self.geometry_target_dim != 2048:
             raise ValueError("P1/P2 v0 Geometry target dimension is frozen at 2048")
-        expected_motion_queries = 8 if self.mode == "semantic_geometry_motion" else 0
+        expected_motion_queries = (
+            8 if self.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground") else 0
+        )
         if self.num_motion_queries != expected_motion_queries:
             raise ValueError(
                 f"{self.mode} requires num_motion_queries={expected_motion_queries}, found {self.num_motion_queries}"
             )
         if self.motion_target_dim != 256 or self.motion_smooth_l1_beta != 1.0:
             raise ValueError("B Motion target dimension/beta are frozen at 256/1.0")
+        if self.mode == "semantic_geometry_motion_binary_ground":
+            if self.ground_objective != "binary_fixed_balanced_bce":
+                raise ValueError("P3 requires binary_fixed_balanced_bce Ground objective")
+            if self.ground_positive_weight is None or not math.isfinite(self.ground_positive_weight):
+                raise ValueError("P3 requires a finite dataset-global fixed Ground positive weight")
+            if self.ground_positive_weight <= 0:
+                raise ValueError("P3 Ground positive weight must be strictly positive")
+        elif self.ground_objective != "coverage_focal_dice" or self.ground_positive_weight is not None:
+            raise ValueError("Only P3 may use the fixed-balanced binary Ground objective/weight")
         for name in ("lambda_sem", "lambda_ground", "lambda_geo", "lambda_motion"):
             value = getattr(self, name)
             if value is not None and value < 0:
@@ -122,6 +142,8 @@ def policy_aux_config_from_train_config(train_config) -> PolicyAuxConfig | None:
         ground_mask_dim=policy_aux.ground_mask_dim,
         ground_focal_alpha=policy_aux.ground_focal_alpha,
         ground_focal_gamma=policy_aux.ground_focal_gamma,
+        ground_objective=getattr(policy_aux, "ground_objective", "coverage_focal_dice"),
+        ground_positive_weight=getattr(policy_aux, "ground_positive_weight", None),
         lambda_geo=policy_aux.lambda_geo,
         lambda_ground=policy_aux.lambda_ground,
         lambda_sem=policy_aux.lambda_sem,
@@ -425,24 +447,19 @@ class PI05AuxPolicy(PI0Pytorch):
         self.aux_config = aux_config
         self.hidden_dim = int(self.paligemma_with_expert.paligemma.language_model.config.hidden_size)
 
-        if aux_config.mode in ("geometry", "semantic_geometry", "semantic_geometry_motion"):
+        if aux_config.mode != "none":
             self.geometry_queries = self._new_queries(aux_config.num_geometry_queries, seed=GEOMETRY_QUERY_INIT_SEED)
             self.geometry_head = self._new_seeded_module(
                 GEOMETRY_HEAD_INIT_SEED,
                 lambda: MeanQueryProjectionHead(self.hidden_dim, aux_config.geometry_target_dim),
             )
-            if aux_config.mode == "semantic_geometry_motion":
-                self.motion_queries = self._new_queries(aux_config.num_motion_queries, seed=MOTION_QUERY_INIT_SEED)
-                self.motion_head = self._new_seeded_module(
-                    MOTION_HEAD_INIT_SEED,
-                    lambda: MeanQueryProjectionHead(self.hidden_dim, aux_config.motion_target_dim),
-                )
-        elif aux_config.mode == "ground_geometry_semantic_lm":
-            self.geometry_queries = self._new_queries(aux_config.num_geometry_queries, seed=GEOMETRY_QUERY_INIT_SEED)
-            self.geometry_head = self._new_seeded_module(
-                GEOMETRY_HEAD_INIT_SEED,
-                lambda: MeanQueryProjectionHead(self.hidden_dim, aux_config.geometry_target_dim),
+        if aux_config.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground"):
+            self.motion_queries = self._new_queries(aux_config.num_motion_queries, seed=MOTION_QUERY_INIT_SEED)
+            self.motion_head = self._new_seeded_module(
+                MOTION_HEAD_INIT_SEED,
+                lambda: MeanQueryProjectionHead(self.hidden_dim, aux_config.motion_target_dim),
             )
+        if aux_config.mode in ("ground_geometry_semantic_lm", "semantic_geometry_motion_binary_ground"):
             self.ground_queries = self._new_queries(aux_config.num_ground_queries, seed=GROUND_QUERY_INIT_SEED)
             self.ground_head = self._new_seeded_module(
                 GROUND_HEAD_INIT_SEED,
@@ -476,7 +493,7 @@ class PI05AuxPolicy(PI0Pytorch):
             "geometry_head.output_projection.weight",
             "geometry_head.output_projection.bias",
         }
-        if self.aux_config.mode == "ground_geometry_semantic_lm":
+        if self.aux_config.mode in ("ground_geometry_semantic_lm", "semantic_geometry_motion_binary_ground"):
             keys.update(
                 {
                     "ground_queries",
@@ -491,7 +508,7 @@ class PI05AuxPolicy(PI0Pytorch):
                     "ground_head.patch_projection.bias",
                 }
             )
-        if self.aux_config.mode == "semantic_geometry_motion":
+        if self.aux_config.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground"):
             keys.update(
                 {
                     "motion_queries",
@@ -776,12 +793,18 @@ class PI05AuxPolicy(PI0Pytorch):
         if semantic_impl not in ("two_pass_reference", "joint_masked"):
             raise ValueError(f"Unsupported semantic implementation: {semantic_impl}")
         if (
-            self.aux_config.mode not in ("semantic_geometry", "semantic_geometry_motion", "ground_geometry_semantic_lm")
+            self.aux_config.mode
+            not in (
+                "semantic_geometry",
+                "semantic_geometry_motion",
+                "ground_geometry_semantic_lm",
+                "semantic_geometry_motion_binary_ground",
+            )
             and semantic_impl != "joint_masked"
         ):
             raise ValueError("The semantic implementation selector requires an enabled Semantic mode")
 
-        if self.aux_config.mode == "ground_geometry_semantic_lm":
+        if self.aux_config.mode in ("ground_geometry_semantic_lm", "semantic_geometry_motion_binary_ground"):
             if aux_targets.ground_masks is None:
                 raise ValueError("P2 requires policy-canvas Grounding masks")
             synchronized = preprocess_observation_and_ground_masks_pytorch(
@@ -826,6 +849,7 @@ class PI05AuxPolicy(PI0Pytorch):
                 "semantic_geometry",
                 "semantic_geometry_motion",
                 "ground_geometry_semantic_lm",
+                "semantic_geometry_motion_binary_ground",
             )
             and not self.aux_config.diagnostic_skip_semantic_lm
         )
@@ -994,29 +1018,42 @@ class PI05AuxPolicy(PI0Pytorch):
                 raise ValueError("Ground target valid-view shape does not match runtime real views")
             ground_states = prefix_output[:, layout.ground.start : layout.ground.end]
             ground_logits = self.ground_head(ground_states, patch_states)
-            ground = grounding_focal_dice_loss(
-                ground_logits,
-                ground_patch_coverage,
-                aux_targets.ground_valid_views,
-                alpha=self.aux_config.ground_focal_alpha,
-                gamma=self.aux_config.ground_focal_gamma,
-            )
+            if self.aux_config.ground_objective == "binary_fixed_balanced_bce":
+                ground = grounding_fixed_balanced_binary_bce_loss(
+                    ground_logits,
+                    ground_patch_coverage,
+                    aux_targets.ground_valid_views,
+                    positive_weight=self.aux_config.ground_positive_weight,
+                )
+            else:
+                ground = grounding_focal_dice_loss(
+                    ground_logits,
+                    ground_patch_coverage,
+                    aux_targets.ground_valid_views,
+                    alpha=self.aux_config.ground_focal_alpha,
+                    gamma=self.aux_config.ground_focal_gamma,
+                )
             losses["ground"] = ground["loss"]
-            diagnostics.update({f"ground_{key}": value for key, value in ground.items() if key != "loss"})
-            for view_index, view_name in enumerate(layout.real_view_names):
-                diagnostic_name = "agent" if view_name == "base_0_rgb" else "wrist"
-                for metric in (
-                    "focal_loss",
-                    "dice_loss",
-                    "dice_score",
-                    "precision",
-                    "recall",
-                    "iou",
-                ):
-                    diagnostics[f"ground_{diagnostic_name}_{metric}"] = ground[f"{metric}_by_view"][view_index]
-                diagnostics[f"ground_{diagnostic_name}_valid_count"] = ground["valid_count_by_view"][view_index]
+            diagnostics.update(
+                {f"ground_{key}": value for key, value in ground.items() if key not in ("loss", "binary_target")}
+            )
+            if self.aux_config.ground_objective == "coverage_focal_dice":
+                for view_index, view_name in enumerate(layout.real_view_names):
+                    diagnostic_name = "agent" if view_name == "base_0_rgb" else "wrist"
+                    for metric in (
+                        "focal_loss",
+                        "dice_loss",
+                        "dice_score",
+                        "precision",
+                        "recall",
+                        "iou",
+                    ):
+                        diagnostics[f"ground_{diagnostic_name}_{metric}"] = ground[f"{metric}_by_view"][view_index]
+                    diagnostics[f"ground_{diagnostic_name}_valid_count"] = ground["valid_count_by_view"][view_index]
             diagnostics["ground_logits"] = ground_logits
             diagnostics["ground_patch_coverage"] = ground_patch_coverage
+            if "binary_target" in ground:
+                diagnostics["ground_binary_target"] = ground["binary_target"]
 
         if semantic_enabled:
             if semantic_impl == "joint_masked":

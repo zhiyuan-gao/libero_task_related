@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import torch
 
 from openpi.models_pytorch import preprocessing_pytorch
+from openpi.models_pytorch.auxiliary_heads import grounding_fixed_balanced_binary_bce_loss
 from openpi.models_pytorch.auxiliary_heads import grounding_focal_dice_loss
 from openpi.models_pytorch.auxiliary_heads import masked_standardized_mse
 from openpi.models_pytorch.auxiliary_heads import masked_standardized_smooth_l1
@@ -30,16 +31,32 @@ def _train_config(mode: str | None):
             mode=mode,
             num_ground_queries=0 if mode in ("semantic_geometry", "semantic_geometry_motion") else 8,
             num_geometry_queries=8,
-            num_motion_queries=8 if mode == "semantic_geometry_motion" else 0,
+            num_motion_queries=8
+            if mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
+            else 0,
             ground_mask_dim=256,
             ground_focal_alpha=0.25,
             ground_focal_gamma=2.0,
             lambda_geo=0.15,
-            lambda_ground=0.50 if mode == "ground_geometry_semantic_lm" else None,
+            lambda_ground=0.05
+            if mode == "semantic_geometry_motion_binary_ground"
+            else (0.50 if mode == "ground_geometry_semantic_lm" else None),
             lambda_sem=0.01
-            if mode in ("semantic_geometry", "semantic_geometry_motion", "ground_geometry_semantic_lm")
+            if mode
+            in (
+                "semantic_geometry",
+                "semantic_geometry_motion",
+                "ground_geometry_semantic_lm",
+                "semantic_geometry_motion_binary_ground",
+            )
             else None,
-            lambda_motion=0.05 if mode == "semantic_geometry_motion" else None,
+            lambda_motion=0.05
+            if mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
+            else None,
+            ground_objective="binary_fixed_balanced_bce"
+            if mode == "semantic_geometry_motion_binary_ground"
+            else "coverage_focal_dice",
+            ground_positive_weight=5.9399674343 if mode == "semantic_geometry_motion_binary_ground" else None,
             policy_manifest_path="/unusable/semantic-and-grounding",
             geometry_target_index_path="/unusable/geometry",
         )
@@ -64,6 +81,7 @@ def test_shared_factory_selects_plain_or_aux_and_drops_teacher_paths(monkeypatch
     semantic_geometry = create_pytorch_model(_train_config("semantic_geometry"))
     semantic_geometry_motion = create_pytorch_model(_train_config("semantic_geometry_motion"))
     p2 = create_pytorch_model(_train_config("ground_geometry_semantic_lm"))
+    p3 = create_pytorch_model(_train_config("semantic_geometry_motion_binary_ground"))
 
     assert type(plain) is FakePlain
     assert type(p1) is FakeAux
@@ -74,7 +92,10 @@ def test_shared_factory_selects_plain_or_aux_and_drops_teacher_paths(monkeypatch
     assert semantic_geometry_motion.aux_config.mode == "semantic_geometry_motion"
     assert semantic_geometry_motion.aux_config.num_motion_queries == 8
     assert p2.aux_config.mode == "ground_geometry_semantic_lm"
-    for model in (p1, semantic_geometry, semantic_geometry_motion, p2):
+    assert p3.aux_config.mode == "semantic_geometry_motion_binary_ground"
+    assert p3.aux_config.ground_objective == "binary_fixed_balanced_bce"
+    assert p3.aux_config.ground_positive_weight == 5.9399674343
+    for model in (p1, semantic_geometry, semantic_geometry_motion, p2, p3):
         assert model.aux_config.semantic_annotation_root is None
         assert model.aux_config.ground_mask_root is None
         assert model.aux_config.geometry_cache_root is None
@@ -205,6 +226,29 @@ def test_motion_smooth_l1_masks_invalid_samples_exactly() -> None:
     assert torch.isclose(loss, torch.tensor(0.75))
     loss.backward()
     assert torch.equal(prediction.grad[1], torch.zeros(2))
+
+
+def test_p3_fixed_balanced_binary_bce_uses_overlap_target_and_full_patch_weight() -> None:
+    logits = torch.tensor([[[0.2, -0.4, 1.0], [20.0, 20.0, 20.0]]], requires_grad=True)
+    coverage = torch.tensor([[[0.0, 0.01, 1.0], [0.0, 0.5, 1.0]]])
+    valid = torch.tensor([[True, False]])
+    weight = 5.9399674343
+    result = grounding_fixed_balanced_binary_bce_loss(
+        logits,
+        coverage,
+        valid,
+        positive_weight=weight,
+        distributed_global_reduction=False,
+    )
+
+    binary = torch.tensor([0.0, 1.0, 1.0])
+    per_patch = torch.nn.functional.binary_cross_entropy_with_logits(logits[0, 0], binary, reduction="none")
+    expected = (per_patch[0] + weight * per_patch[1:].sum()) / (1.0 + 2.0 * weight)
+    assert torch.allclose(result["loss"], expected)
+    assert torch.equal(result["binary_target"], coverage > 0)
+    assert torch.isclose(result["fixed_positive_weight"], torch.tensor(weight))
+    result["loss"].backward()
+    assert torch.equal(logits.grad[0, 1], torch.zeros(3))
 
 
 def test_explicit_p2_attention_rectangles() -> None:

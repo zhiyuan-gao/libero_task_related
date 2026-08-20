@@ -532,6 +532,11 @@ class TrainConfig:
     save_final_checkpoint: bool = True
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
     keep_period: int | None = 5000
+    # Additional exact milestones that survive ordinary checkpoint pruning.
+    checkpoint_keep_steps: tuple[int, ...] = ()
+    # Optional rolling retention cap for ordinary scheduled/final checkpoints.
+    # Exact milestones and keep_period checkpoints remain protected.
+    max_checkpoints_to_keep: int | None = None
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -570,6 +575,12 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if any(step <= 0 for step in self.checkpoint_keep_steps) or len(set(self.checkpoint_keep_steps)) != len(
+            self.checkpoint_keep_steps
+        ):
+            raise ValueError("checkpoint_keep_steps must contain unique positive optimizer steps")
+        if self.max_checkpoints_to_keep is not None and self.max_checkpoints_to_keep <= 0:
+            raise ValueError("max_checkpoints_to_keep must be positive when set")
         frozen_policy_aux = {
             "pi05_libero_p1_aux": {
                 "mode": "geometry",
@@ -619,6 +630,14 @@ class TrainConfig:
                 "lambda_motion": 0.05,
                 "diagnostic_skip_semantic_lm": False,
             },
+            "pi05_libero3_p3_binary_ground_aux": {
+                "mode": "semantic_geometry_motion_binary_ground",
+                "lambda_geo": 0.15,
+                "lambda_ground": 0.05,
+                "lambda_sem": 0.01,
+                "lambda_motion": 0.05,
+                "diagnostic_skip_semantic_lm": False,
+            },
         }
         if expected := frozen_policy_aux.get(self.name):
             if self.policy_aux is None or not self.policy_aux.loss_coefficients_approved:
@@ -635,6 +654,13 @@ class TrainConfig:
                 raise ValueError(
                     f"{self.name} auxiliary architecture/lambdas are frozen: expected={expected}, observed={observed}"
                 )
+            if self.name == "pi05_libero3_p3_binary_ground_aux" and (
+                self.policy_aux.ground_objective != "binary_fixed_balanced_bce"
+                or self.policy_aux.ground_positive_weight != _policy_aux_dataset.LIBERO3_BINARY_GROUND_POSITIVE_WEIGHT
+                or self.policy_aux.num_ground_queries != 8
+                or self.policy_aux.num_motion_queries != 8
+            ):
+                raise ValueError("LIBERO-3 P3 Binary Ground objective, global weight, and query counts are frozen")
             if self.name.startswith("pi05_libero3_") and (
                 tuple(self.policy_aux.lerobot_task_indices or ()) != _policy_aux_dataset.LIBERO3_PILOT_TASK_INDICES
             ):
@@ -1117,6 +1143,59 @@ _CONFIGS = [
         checkpoint_base_dir="/workspace/vla/checkpoints/openpi_policy_aux",
         num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
         keep_period=1000,
+    ),
+    # P3: B plus task-relevant Binary Ground. Coverage annotations remain
+    # immutable; m=1[y>0] is derived after synchronized image/mask transforms.
+    # The fixed weight is the one-time LIBERO-3 train-split statistic approved
+    # after the zero-update and 100-update diagnostics.
+    TrainConfig(
+        name="pi05_libero3_p3_binary_ground_aux",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=10, discrete_state_input=False),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            assets=AssetsConfig(assets_dir=_POLICY_AUX_LIBERO_ASSETS),
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        policy_aux=_policy_aux_dataset.PolicyAuxTrainConfig(
+            mode="semantic_geometry_motion_binary_ground",
+            policy_manifest_path=f"{_POLICY_AUX_ROOT}/manifests/libero10_policy_aux_manifest.parquet",
+            episode_mapping_path=f"{_POLICY_AUX_ROOT}/debug/lerobot_episode_mapping.json",
+            geometry_target_index_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/target_index.parquet",
+            geometry_normalization_path=f"{_POLICY_AUX_ROOT}/geometry_libero10/normalization/train_mean_std.json",
+            motion_target_index_path=f"{_POLICY_AUX_ROOT}/motion_libero10_tasks_0_3_8_v1/index.parquet",
+            motion_normalization_path=(
+                f"{_POLICY_AUX_ROOT}/motion_libero10_tasks_0_3_8_v1/target_statistics_train.json"
+            ),
+            lambda_sem=0.01,
+            lambda_geo=0.15,
+            lambda_motion=0.05,
+            lambda_ground=0.05,
+            num_ground_queries=8,
+            num_motion_queries=8,
+            ground_objective="binary_fixed_balanced_bce",
+            ground_positive_weight=_policy_aux_dataset.LIBERO3_BINARY_GROUND_POSITIVE_WEIGHT,
+            lerobot_root=_POLICY_AUX_LEROBOT_ROOT,
+            lerobot_task_indices=_policy_aux_dataset.LIBERO3_PILOT_TASK_INDICES,
+            loss_coefficients_approved=True,
+        ),
+        batch_size=256,
+        gradient_accumulation_steps=1,
+        num_workers=8,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=_POLICY_AUX_LIBERO3_WARMUP_STEPS,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=None,
+        pytorch_weight_path=_POLICY_AUX_BASE_WEIGHTS,
+        checkpoint_base_dir="/workspace/vla/p3/checkpoints/p3_binary_ground",
+        num_train_steps=_POLICY_AUX_LIBERO3_NUM_TRAIN_STEPS,
+        save_interval=500,
+        keep_period=None,
+        checkpoint_keep_steps=(500, 1_000, 2_000, 3_209),
     ),
     TrainConfig(
         name="pi05_libero3_p2_aux",

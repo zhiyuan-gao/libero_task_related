@@ -1,8 +1,10 @@
 import collections
 import dataclasses
+import json
 import logging
 import math
 import pathlib
+import time
 import typing
 
 import imageio
@@ -56,6 +58,8 @@ class Args:
     # Utils
     #################################################################################################################
     video_out_path: str = "data/libero/videos"  # Path to save videos
+    output_jsonl: str = "data/libero/results.jsonl"  # One durable record per completed rollout
+    save_video: bool = True
 
     seed: int = 7  # Random Seed (for reproducibility)
     # Enforce the frozen LIBERO-10 evaluation recipe. Use --no-formal only for
@@ -105,6 +109,33 @@ def _episode_ids_for_shard(
     ]
 
 
+def _load_completed_episode_ids(path: pathlib.Path) -> typing.Set[typing.Tuple[int, int]]:  # noqa: UP006
+    """Load durable results so an interrupted shard can resume without rerunning episodes."""
+
+    completed = set()
+    if not path.exists():
+        return completed
+    with path.open(encoding="utf-8") as results:
+        for line_number, line in enumerate(results, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+                key = (int(record["task_id"]), int(record["episode_idx"]))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+                raise ValueError(f"Invalid result record at {path}:{line_number}") from error
+            if key in completed:
+                raise ValueError(f"Duplicate completed episode {key} in {path}")
+            completed.add(key)
+    return completed
+
+
+def _append_jsonl(path: pathlib.Path, record: typing.Dict[str, typing.Any]) -> None:  # noqa: UP006
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(record, sort_keys=True) + "\n")
+        output.flush()
+
+
 def eval_libero(args: Args) -> None:
     _validate_formal_protocol(args)
 
@@ -125,7 +156,14 @@ def eval_libero(args: Args) -> None:
         logging.info("Frozen LeRobot task mapping: 0->4, 3->2, 8->3")
     logging.info(f"Evaluation shard: {args.shard_index}/{args.num_shards}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    video_out_path = pathlib.Path(args.video_out_path)
+    if args.save_video:
+        video_out_path.mkdir(parents=True, exist_ok=True)
+    output_jsonl = pathlib.Path(args.output_jsonl)
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    completed_episode_ids = _load_completed_episode_ids(output_jsonl)
+    logging.info(f"Output JSONL: {output_jsonl}")
+    logging.info(f"Previously completed rollouts on this shard: {len(completed_episode_ids)}")
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -140,7 +178,11 @@ def eval_libero(args: Args) -> None:
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
-    client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
+    # The first compiled PyTorch inference can take longer than the websocket
+    # library's 20-second keepalive timeout. This is a local connection and
+    # formal rollouts already fail fast on inference errors, so disable ping
+    # keepalives rather than invalidating the first episode during compilation.
+    client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port, ping_interval=None)
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -163,9 +205,13 @@ def eval_libero(args: Args) -> None:
                 args.num_shards,
                 args.shard_index,
             )
+            episode_ids = [
+                episode_idx for episode_idx in episode_ids if (task_id, episode_idx) not in completed_episode_ids
+            ]
             logging.info(f"Shard episode IDs for benchmark task {task_id}: {episode_ids}")
             for episode_idx in tqdm.tqdm(episode_ids):
                 logging.info(f"\nTask: {task_description}")
+                started = time.monotonic()
 
                 # Reset environment
                 env.reset()
@@ -251,26 +297,53 @@ def eval_libero(args: Args) -> None:
                 # Save a uniquely named replay instead of overwriting earlier trials.
                 suffix = "success" if done else "failure"
                 task_segment = task_description.replace(" ", "_")
-                if replay_images:
+                if args.save_video and replay_images:
                     imageio.mimwrite(
-                        pathlib.Path(args.video_out_path)
+                        video_out_path
                         / f"rollout_task{task_id:02d}_episode{episode_idx:03d}_{task_segment}_{suffix}.mp4",
                         [np.asarray(x) for x in replay_images],
                         fps=10,
                     )
 
+                _append_jsonl(
+                    output_jsonl,
+                    {
+                        "task_id": task_id,
+                        "task_position": task_position,
+                        "task_description": str(task_description),
+                        "episode_idx": episode_idx,
+                        "shard_index": args.shard_index,
+                        "num_shards": args.num_shards,
+                        "seed": args.seed,
+                        "success": bool(done),
+                        "sim_steps": t,
+                        "elapsed_seconds": time.monotonic() - started,
+                        "error": None,
+                    },
+                )
+
                 # Log current results
                 logging.info(f"Success: {done}")
+                logging.info(
+                    "Episode result: task_id=%d episode_idx=%d shard_index=%d success=%s",
+                    task_id,
+                    episode_idx,
+                    args.shard_index,
+                    done,
+                )
                 logging.info(f"# episodes completed so far: {total_episodes}")
                 logging.info(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)")
 
             # Log final results
-            logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
-            logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
+            if task_episodes:
+                logging.info(f"Current task success rate: {float(task_successes) / float(task_episodes)}")
+            if total_episodes:
+                logging.info(f"Current total success rate: {float(total_successes) / float(total_episodes)}")
         finally:
             env.close()
 
-    logging.info(f"Total success rate: {float(total_successes) / float(total_episodes)}")
+    if total_episodes:
+        logging.info(f"New-rollout success rate: {float(total_successes) / float(total_episodes)}")
     logging.info(f"Total episodes: {total_episodes}")
 
 

@@ -53,6 +53,8 @@ def test_trajectory_config_ignores_runtime_controls_but_not_recipe(tmp_path) -> 
         save_interval=1000,
         save_final_checkpoint=False,
         keep_period=None,
+        checkpoint_keep_steps=(1, 4),
+        max_checkpoints_to_keep=8,
         log_interval=1,
         resume=True,
         wandb_enabled=True,
@@ -73,6 +75,39 @@ def test_prune_checkpoints_preserves_periodic_and_latest(tmp_path) -> None:
 
     assert removed == [1000, 3000]
     assert {path.name for path in tmp_path.iterdir()} == {"2000", "4000", "5000", "tmp_6000", "notes"}
+
+
+def test_prune_checkpoints_preserves_exact_p3_milestones(tmp_path) -> None:
+    for step in (500, 1000, 1500, 2000, 2500, 3000, 3209):
+        (tmp_path / str(step)).mkdir()
+
+    removed = train_pytorch.prune_checkpoints(
+        tmp_path,
+        keep_period=None,
+        keep_steps=(500, 1000, 2000, 3209),
+    )
+
+    assert removed == [1500, 2500, 3000]
+    assert {path.name for path in tmp_path.iterdir()} == {"500", "1000", "2000", "3209"}
+
+
+def test_prune_checkpoints_can_keep_last_eight_for_libero10(tmp_path) -> None:
+    for step in (*range(1000, 12_000, 1000), 11_132):
+        (tmp_path / str(step)).mkdir()
+
+    removed = train_pytorch.prune_checkpoints(tmp_path, keep_period=None, max_to_keep=8)
+
+    assert removed == [1000, 2000, 3000, 4000]
+    assert {int(path.name) for path in tmp_path.iterdir()} == {
+        5000,
+        6000,
+        7000,
+        8000,
+        9000,
+        10_000,
+        11_000,
+        11_132,
+    }
 
 
 def test_checkpoint_roundtrip_restores_raw_ema_and_allows_runtime_changes(tmp_path, monkeypatch) -> None:

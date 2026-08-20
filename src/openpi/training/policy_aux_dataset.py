@@ -22,7 +22,13 @@ class SemanticTeacherTensors:
     loss_mask: np.ndarray
 
 
-PolicyAuxMode = Literal["geometry", "semantic_geometry", "semantic_geometry_motion", "ground_geometry_semantic_lm"]
+PolicyAuxMode = Literal[
+    "geometry",
+    "semantic_geometry",
+    "semantic_geometry_motion",
+    "ground_geometry_semantic_lm",
+    "semantic_geometry_motion_binary_ground",
+]
 
 CANONICAL_LIBERO_REVISION = "a4336d589d589045d1c56423ffdf3b88a0e19b1f"
 CANONICAL_LIBERO_EPISODES = 379
@@ -30,6 +36,9 @@ CANONICAL_LIBERO_FRAMES = 101_469
 LIBERO3_PILOT_TASK_INDICES = (0, 3, 8)
 LIBERO3_PILOT_EPISODES = 114
 LIBERO3_PILOT_FRAMES = 29_250
+LIBERO3_BINARY_GROUND_POSITIVE_PATCHES = 2_094_230
+LIBERO3_BINARY_GROUND_NEGATIVE_PATCHES = 12_439_658
+LIBERO3_BINARY_GROUND_POSITIVE_WEIGHT = 5.9399674343
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,6 +63,8 @@ class PolicyAuxTrainConfig:
     ground_mask_dim: int = 256
     ground_focal_alpha: float = 0.25
     ground_focal_gamma: float = 2.0
+    ground_objective: Literal["coverage_focal_dice", "binary_fixed_balanced_bce"] = "coverage_focal_dice"
+    ground_positive_weight: float | None = None
     lerobot_revision: str = CANONICAL_LIBERO_REVISION
     lerobot_root: str | None = None
     lerobot_task_indices: tuple[int, ...] | None = None
@@ -68,16 +79,22 @@ class PolicyAuxTrainConfig:
             "semantic_geometry",
             "semantic_geometry_motion",
             "ground_geometry_semantic_lm",
+            "semantic_geometry_motion_binary_ground",
         ):
             raise ValueError(f"Unsupported policy auxiliary training mode: {self.mode}")
         if self.diagnostic_skip_semantic_lm and self.mode != "ground_geometry_semantic_lm":
             raise ValueError("The semantic-LM ablation requires the complete P2 mode")
         required_lambdas = ["lambda_geo"]
-        if self.mode in ("semantic_geometry", "semantic_geometry_motion", "ground_geometry_semantic_lm"):
+        if self.mode in (
+            "semantic_geometry",
+            "semantic_geometry_motion",
+            "ground_geometry_semantic_lm",
+            "semantic_geometry_motion_binary_ground",
+        ):
             required_lambdas.append("lambda_sem")
-        if self.mode == "semantic_geometry_motion":
+        if self.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground"):
             required_lambdas.append("lambda_motion")
-        if self.mode == "ground_geometry_semantic_lm":
+        if self.mode in ("ground_geometry_semantic_lm", "semantic_geometry_motion_binary_ground"):
             required_lambdas.append("lambda_ground")
         if self.loss_coefficients_approved and any(getattr(self, name) is None for name in required_lambdas):
             raise ValueError(f"Approved P1/P2 config is missing a required loss coefficient: {required_lambdas}")
@@ -96,15 +113,26 @@ class PolicyAuxTrainConfig:
             raise ValueError(
                 f"{self.mode} requires num_ground_queries={expected_ground_queries}, found {self.num_ground_queries}"
             )
-        expected_motion_queries = 8 if self.mode == "semantic_geometry_motion" else 0
+        expected_motion_queries = (
+            8 if self.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground") else 0
+        )
         if self.num_motion_queries != expected_motion_queries:
             raise ValueError(
                 f"{self.mode} requires num_motion_queries={expected_motion_queries}, found {self.num_motion_queries}"
             )
-        if self.mode == "semantic_geometry_motion" and (
+        if self.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground") and (
             self.motion_target_index_path is None or self.motion_normalization_path is None
         ):
             raise ValueError("B requires Motion target index and train normalization paths")
+        if self.mode == "semantic_geometry_motion_binary_ground":
+            if self.ground_objective != "binary_fixed_balanced_bce":
+                raise ValueError("P3 requires binary_fixed_balanced_bce Ground objective")
+            if self.ground_positive_weight is None or not np.isfinite(self.ground_positive_weight):
+                raise ValueError("P3 requires a finite dataset-global fixed Ground positive weight")
+            if self.ground_positive_weight <= 0:
+                raise ValueError("P3 Ground positive weight must be strictly positive")
+        elif self.ground_objective != "coverage_focal_dice" or self.ground_positive_weight is not None:
+            raise ValueError("Only P3 may use the fixed-balanced binary Ground objective/weight")
         if self.lerobot_revision != CANONICAL_LIBERO_REVISION:
             raise ValueError(
                 f"P1/P2 policy training is frozen to official LeRobot revision {CANONICAL_LIBERO_REVISION}"
@@ -434,7 +462,7 @@ class PolicyAuxTargetIndex:
         self.geometry = GeometryPolicyTargetIndex(config.geometry_target_index_path, config.geometry_normalization_path)
         self.motion = (
             MotionPolicyTargetIndex(config.motion_target_index_path, config.motion_normalization_path)
-            if config.mode == "semantic_geometry_motion"
+            if config.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
             else None
         )
         self.semantic_tokenizer = PolicySemanticTokenizer(config.semantic_max_target_len)
@@ -464,7 +492,7 @@ class PolicyAuxTargetIndex:
             "geometry_mean": self.geometry.mean,
             "geometry_std": self.geometry.std,
         }
-        if self.config.mode == "ground_geometry_semantic_lm":
+        if self.config.mode in ("ground_geometry_semantic_lm", "semantic_geometry_motion_binary_ground"):
             masks, ground_valid = self.annotations.load_upright_ground_masks(row)
             result.update(
                 {
@@ -483,7 +511,12 @@ class PolicyAuxTargetIndex:
                     "motion_std": motion_index.std,
                 }
             )
-        if self.config.mode in ("semantic_geometry", "semantic_geometry_motion", "ground_geometry_semantic_lm"):
+        if self.config.mode in (
+            "semantic_geometry",
+            "semantic_geometry_motion",
+            "ground_geometry_semantic_lm",
+            "semantic_geometry_motion_binary_ground",
+        ):
             semantic = self.semantic_tokenizer.fixed(str(row["semantic_subtask"]))
             result.update(
                 {
