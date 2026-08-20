@@ -47,7 +47,11 @@ if [[ $visible_gpus -ne $nproc_per_node ]]; then
 fi
 
 "$openpi_python" - <<'PY'
+import hashlib
+from pathlib import Path
+
 from openpi.training import config
+from safetensors import safe_open
 
 cfg = config.get_config("pi05_libero3_semantic_geometry_aux")
 assert cfg.ema_decay is None
@@ -62,7 +66,19 @@ assert cfg.gradient_accumulation_steps == 1
 assert cfg.num_train_steps == 3209
 assert cfg.lr_schedule.warmup_steps == 1069
 assert cfg.keep_period == 1000
+checkpoint = Path(cfg.pytorch_weight_path) / "model.safetensors"
+assert checkpoint.stat().st_size == 14_467_165_872
+with safe_open(checkpoint, framework="pt", device="cpu") as handle:
+    tensor_names = list(handle.keys())
+    assert len(tensor_names) == 812
+    assert all(handle.get_slice(name).get_dtype() == "F32" for name in tensor_names)
+digest = hashlib.sha256()
+with checkpoint.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+        digest.update(chunk)
+assert digest.hexdigest() == "4f5facee8d0897bcc95900929e2cdb978a4cebd63651d80155444d4c086c23ee"
 print("SEMANTIC_GEOMETRY_CONFIG_GATE=PASS")
+print("STRICT_FP32_BASE_GATE=PASS")
 PY
 
 common_args=(
