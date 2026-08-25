@@ -1,328 +1,222 @@
-# openpi
+# LIBERO-40 Task-Relevant Query Conditioning
 
-> This release branch's LIBERO-40 Task-Relevant Query Conditioning (TRQC) code and protocol live in
-> [`experiments/four_suite_joint`](experiments/four_suite_joint/README.md).
-> Generated targets, checkpoints, results, diagnostics, and prior experiment
-> reports are intentionally excluded.
+This release branch is the self-contained code and runbook for the three
+frozen LIBERO-40 experiments below. It intentionally excludes historical
+reports, evaluation outputs, checkpoints, generated caches, and unrelated
+OpenPI examples. Upstream and Gemma license files remain in the repository.
 
-openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
+## Experiments
 
-Currently, this repo contains three types of models:
-- the [π₀ model](https://www.physicalintelligence.company/blog/pi0), a flow-based vision-language-action model (VLA).
-- the [π₀-FAST model](https://www.physicalintelligence.company/research/fast), an autoregressive VLA, based on the FAST action tokenizer.
-- the [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05), an upgraded version of π₀ with better open-world generalization trained with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation). Note that, in this repository, we currently only support the flow matching head for both $\pi_{0.5}$ training and inference.
+All variants use the official 40-task LeRobot training set: 1,693 episodes and
+273,465 frames across `libero_10`, `libero_goal`, `libero_object`, and
+`libero_spatial`.
 
-For all models, we provide _base model_ checkpoints, pre-trained on 10k+ hours of robot data, and examples for using them out of the box or fine-tuning them to your own datasets.
+| CLI variant | Semantic target | Geometry target | Motion target | Action reads Geometry/Motion queries |
+| --- | --- | --- | --- | --- |
+| `trqc` | task-relevant | task-relevant | task-relevant | yes |
+| `whole_scene` | task-relevant | whole-scene | whole-scene | yes |
+| `no_query_access` | task-relevant | task-relevant | task-relevant | no |
 
-This is an experiment: $\pi_0$ was developed for our own robots, which differ from the widely used platforms such as [ALOHA](https://tonyzhaozh.github.io/aloha/) and [DROID](https://droid-dataset.github.io/), and though we are optimistic that researchers and practitioners will be able to run creative new experiments adapting $\pi_0$ to their own platforms, we do not expect every such attempt to be successful. All this is to say: $\pi_0$ may or may not work for you, but you are welcome to try it and see!
+The frozen auxiliary objective is
 
-## Updates
+```text
+L = L_action + 0.01 L_semantic + 0.05 L_geometry + 0.05 L_motion
+```
 
-- [Sept 2025] We released PyTorch support in openpi.
-- [Sept 2025] We released pi05, an upgraded version of pi0 with better open-world generalization.
-- [Sept 2025]: We have added an [improved idle filter](examples/droid/README_train.md#data-filtering) for DROID training.
-- [Jun 2025]: We have added [instructions](examples/droid/README_train.md) for using `openpi` to train VLAs on the full [DROID dataset](https://droid-dataset.github.io/). This is an approximate open-source implementation of the training pipeline used to train pi0-FAST-DROID. 
+Every variant has eight Geometry queries and eight Motion queries. Grounding is
+disabled. `no_query_access` changes only the Action Expert attention access;
+its targets and losses are identical to `trqc`.
 
+The candidate formal recipe is 30,000 optimizer updates, 10,000 warmup
+updates, global batch 256, seed 42, BF16, AdamW, gradient clipping at 1.0, and
+no EMA. Training saves every 1,000 updates and retains the latest three
+checkpoints. Formal training is gated and is never started by installation,
+download, preparation, testing, or preflight commands.
 
-## Requirements
+## Required HPC environment
 
-To run the models in this repository, you will need an NVIDIA GPU with at least the following specifications. These estimations assume a single GPU, but you can also use multiple GPUs with model parallelism to reduce per-GPU memory requirements by configuring `fsdp_devices` in the training config. Please also note that the current training script does not yet support multi-node training.
+- Linux x86_64 with Git and `curl`
+- Slurm allocation for one node with exactly 8 visible NVIDIA GPUs
+  (the validated target is 8 x A100 80 GB)
+- 64 CPU cores per training job and persistent scratch storage
+- An NVIDIA driver compatible with the CUDA runtime resolved by the lockfile
+- Access to the private Hugging Face dataset
+  `Zhiyuan17/libero40-trqc-assets`
 
-| Mode               | Memory Required | Example GPU        |
-| ------------------ | --------------- | ------------------ |
-| Inference          | > 8 GB          | RTX 4090           |
-| Fine-Tuning (LoRA) | > 22.5 GB       | RTX 4090           |
-| Fine-Tuning (Full) | > 70 GB         | A100 (80GB) / H100 |
+The repository lockfile installs Python 3.11, PyTorch 2.7.1, and Transformers
+4.53.2. Do not create a different environment by hand.
 
-The repo has been tested with Ubuntu 22.04, we do not currently support other operating systems.
-
-## Installation
-
-When cloning this repo, make sure to update submodules:
+## 1. Clone and install
 
 ```bash
-git clone --recurse-submodules git@github.com:Physical-Intelligence/openpi.git
+export LIBERO40_ROOT=/scratch/$USER/libero40
+mkdir -p "$LIBERO40_ROOT"
+cd "$LIBERO40_ROOT"
 
-# Or if you already cloned the repo:
-git submodule update --init --recursive
+git clone --recurse-submodules \
+  --branch libero40-task-relevant-query-conditioning-release \
+  https://github.com/zhiyuan-gao/libero_task_related.git
+cd libero_task_related
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+export PATH="$HOME/.local/bin:$PATH"
+./experiments/four_suite_joint/jobs/setup_python_env.sh
+
+FOUR_SUITE_PYTHON="$PWD/.venv/bin/python" \
+  ./experiments/four_suite_joint/jobs/run_8gpu.sh test
 ```
 
-We use [uv](https://docs.astral.sh/uv/) to manage Python dependencies. See the [uv installation instructions](https://docs.astral.sh/uv/getting-started/installation/) to set it up. Once uv is installed, run the following to set up the environment:
+The setup script initializes submodules, performs `uv sync --frozen`, installs
+the repository's Transformers replacement, and verifies the pinned versions.
+
+## 2. Download the frozen inputs
+
+There are two independent downloads.
+
+### Public LeRobot data
+
+The downloader pins `physical-intelligence/libero` to revision
+`a4336d589d589045d1c56423ffdf3b88a0e19b1f` and rejects an incomplete or
+different 1,693-episode snapshot.
 
 ```bash
-GIT_LFS_SKIP_SMUDGE=1 uv sync
-GIT_LFS_SKIP_SMUDGE=1 uv pip install -e .
+cd "$LIBERO40_ROOT/libero_task_related/experiments/four_suite_joint"
+./jobs/run_8gpu.sh download-data --cache-dir "$LIBERO40_ROOT/hf/hub"
 ```
 
-NOTE: `GIT_LFS_SKIP_SMUDGE=1` is needed to pull LeRobot as a dependency.
+Record the absolute `downloaded_snapshot` path printed by this command; it is
+used as `FOUR_SUITE_LEROBOT_ROOT` below.
 
-**Docker**: As an alternative to uv installation, we provide instructions for installing openpi using Docker. If you encounter issues with your system setup, consider using Docker to simplify installation. See [Docker Setup](docs/docker.md) for more details.
+### Private research assets
 
-
-
-
-## Model Checkpoints
-
-### Base Models
-We provide multiple base VLA model checkpoints. These checkpoints have been pre-trained on 10k+ hours of robot data, and can be used for fine-tuning.
-
-| Model        | Use Case    | Description                                                                                                 | Checkpoint Path                                |
-| ------------ | ----------- | ----------------------------------------------------------------------------------------------------------- | ---------------------------------------------- |
-| $\pi_0$      | Fine-Tuning | Base [π₀ model](https://www.physicalintelligence.company/blog/pi0) for fine-tuning                | `gs://openpi-assets/checkpoints/pi0_base`      |
-| $\pi_0$-FAST | Fine-Tuning | Base autoregressive [π₀-FAST model](https://www.physicalintelligence.company/research/fast) for fine-tuning | `gs://openpi-assets/checkpoints/pi0_fast_base` |
-| $\pi_{0.5}$    | Fine-Tuning | Base [π₀.₅ model](https://www.physicalintelligence.company/blog/pi05) for fine-tuning    | `gs://openpi-assets/checkpoints/pi05_base`      |
-
-### Fine-Tuned Models
-We also provide "expert" checkpoints for various robot platforms and tasks. These models are fine-tuned from the base models above and intended to run directly on the target robot. These may or may not work on your particular robot. Since these checkpoints were fine-tuned on relatively small datasets collected with more widely available robots, such as ALOHA and the DROID Franka setup, they might not generalize to your particular setup, though we found some of these, especially the DROID checkpoint, to generalize quite broadly in practice.
-
-| Model                    | Use Case    | Description                                                                                                                                                                                              | Checkpoint Path                                       |
-| ------------------------ | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| $\pi_0$-FAST-DROID       | Inference   | $\pi_0$-FAST model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): can perform a wide range of simple table-top manipulation tasks 0-shot in new scenes on the DROID robot platform | `gs://openpi-assets/checkpoints/pi0_fast_droid`       |
-| $\pi_0$-DROID            | Fine-Tuning | $\pi_0$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/): faster inference than $\pi_0$-FAST-DROID, but may not follow language commands as well                                | `gs://openpi-assets/checkpoints/pi0_droid`            |
-| $\pi_0$-ALOHA-towel      | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can fold diverse towels 0-shot on ALOHA robot platforms                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_towel`      |
-| $\pi_0$-ALOHA-tupperware | Inference   | $\pi_0$ model fine-tuned on internal [ALOHA](https://tonyzhaozh.github.io/aloha/) data: can unpack food from a tupperware container                                                                                                             | `gs://openpi-assets/checkpoints/pi0_aloha_tupperware` |
-| $\pi_0$-ALOHA-pen-uncap  | Inference   | $\pi_0$ model fine-tuned on public [ALOHA](https://dit-policy.github.io/) data: can uncap a pen                                                                                                          | `gs://openpi-assets/checkpoints/pi0_aloha_pen_uncap`  |
-| $\pi_{0.5}$-LIBERO      | Inference   | $\pi_{0.5}$ model fine-tuned for the [LIBERO](https://libero-project.github.io/datasets) benchmark: gets state-of-the-art performance (see [LIBERO README](examples/libero/README.md)) | `gs://openpi-assets/checkpoints/pi05_libero`      |
-| $\pi_{0.5}$-DROID      | Inference / Fine-Tuning | $\pi_{0.5}$ model fine-tuned on the [DROID dataset](https://droid-dataset.github.io/) with [knowledge insulation](https://www.physicalintelligence.company/research/knowledge_insulation): fast inference and good language-following | `gs://openpi-assets/checkpoints/pi05_droid`      |
-
-
-By default, checkpoints are automatically downloaded from `gs://openpi-assets` and are cached in `~/.cache/openpi` when needed. You can overwrite the download path by setting the `OPENPI_DATA_HOME` environment variable.
-
-
-
-
-## Running Inference for a Pre-Trained Model
-
-Our pre-trained model checkpoints can be run with a few lines of code (here our $\pi_0$-FAST-DROID model):
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = download.maybe_download("gs://openpi-assets/checkpoints/pi05_droid")
-
-# Create a trained policy.
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference on a dummy example.
-example = {
-    "observation/exterior_image_1_left": ...,
-    "observation/wrist_image_left": ...,
-    ...
-    "prompt": "pick up the fork"
-}
-action_chunk = policy.infer(example)["actions"]
-```
-You can also test this out in the [example notebook](examples/inference.ipynb).
-
-We provide detailed step-by-step examples for running inference of our pre-trained checkpoints on [DROID](examples/droid/README.md) and [ALOHA](examples/aloha_real/README.md) robots.
-
-**Remote Inference**: We provide [examples and code](docs/remote_inference.md) for running inference of our models **remotely**: the model can run on a different server and stream actions to the robot via a websocket connection. This makes it easy to use more powerful GPUs off-robot and keep robot and policy environments separate.
-
-**Test inference without a robot**: We provide a [script](examples/simple_client/README.md) for testing inference without a robot. This script will generate a random observation and run inference with the model. See [here](examples/simple_client/README.md) for more details.
-
-
-
-
-
-## Fine-Tuning Base Models on Your Own Data
-
-We will fine-tune the $\pi_{0.5}$ model on the [LIBERO dataset](https://libero-project.github.io/datasets) as a running example for how to fine-tune a base model on your own data. We will explain three steps:
-1. Convert your data to a LeRobot dataset (which we use for training)
-2. Defining training configs and running training
-3. Spinning up a policy server and running inference
-
-### 1. Convert your data to a LeRobot dataset
-
-We provide a minimal example script for converting LIBERO data to a LeRobot dataset in [`examples/libero/convert_libero_data_to_lerobot.py`](examples/libero/convert_libero_data_to_lerobot.py). You can easily modify it to convert your own data! You can download the raw LIBERO dataset from [here](https://huggingface.co/datasets/openvla/modified_libero_rlds), and run the script with:
+Login is interactive and can use the browser verification flow. Download the
+immutable tag, not the moving repository head.
 
 ```bash
-uv run examples/libero/convert_libero_data_to_lerobot.py --data_dir /path/to/your/libero/data
+cd "$LIBERO40_ROOT/libero_task_related"
+uvx --from 'huggingface_hub>=1.0' hf auth login
+uvx --from 'huggingface_hub>=1.0' hf download \
+  Zhiyuan17/libero40-trqc-assets \
+  --repo-type dataset \
+  --revision task-relevant-v1 \
+  --local-dir "$LIBERO40_ROOT/assets"
+
+cd "$LIBERO40_ROOT/assets"
+sha256sum -c SHA256SUMS
 ```
 
-**Note:** If you just want to fine-tune on LIBERO, you can skip this step, because our LIBERO fine-tuning configs point to a pre-converted LIBERO dataset. This step is merely an example that you can adapt to your own data.
+`task-relevant-v1` resolves to asset commit
+`45393408a29bb9cb04e03855494ea00d7d2bc9be`. It contains:
 
-### 2. Defining training configs and running training
+- the strict FP32-converted pi0.5 PyTorch base;
+- official LIBERO policy normalization statistics;
+- the frozen sample-identity and Semantic manifest;
+- task-relevant Geometry targets for 273,377 valid frames;
+- task-relevant Motion targets for 256,401 valid frames.
 
-To fine-tune a base model on your own data, you need to define configs for data processing and training. We provide example configs with detailed comments for LIBERO below, which you can modify for your own dataset:
+The 16.96 GB asset release does not duplicate the public LeRobot data and does
+not contain checkpoints, reports, worker logs, or Whole-scene targets.
 
-- [`LiberoInputs` and `LiberoOutputs`](src/openpi/policies/libero_policy.py): Defines the data mapping from the LIBERO environment to the model and vice versa. Will be used for both, training and inference.
-- [`LeRobotLiberoDataConfig`](src/openpi/training/config.py): Defines how to process raw LIBERO data from LeRobot dataset for training.
-- [`TrainConfig`](src/openpi/training/config.py): Defines fine-tuning hyperparameters, data config, and weight loader.
-
-We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data.
-
-Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
+## 3. Configure local paths
 
 ```bash
-uv run scripts/compute_norm_stats.py --config-name pi05_libero
+cd "$LIBERO40_ROOT/libero_task_related/experiments/four_suite_joint"
+cp hpc.env.example hpc.env
 ```
 
-Now we can kick off training with the following command (the `--overwrite` flag is used to overwrite existing checkpoints if you rerun fine-tuning with the same config):
+Replace every `REPLACE_USER` value in `hpc.env`. Also set
+`FOUR_SUITE_LEROBOT_ROOT` to the exact snapshot path printed by the public-data
+download. The important path mapping is:
+
+```text
+FOUR_SUITE_ANNOTATION_ROOT=$LIBERO40_ROOT/assets/annotation
+FOUR_SUITE_JOINT_MANIFEST=$LIBERO40_ROOT/assets/runtime_metadata/four_suite_policy_geometry_manifest.parquet
+FOUR_SUITE_BASE_WEIGHTS=$LIBERO40_ROOT/assets/models/pi05_base_pytorch_fp32
+FOUR_SUITE_LIBERO_ASSETS=$LIBERO40_ROOT/assets/models/pi05_libero_pytorch/assets
+```
+
+Keep `hpc.env` untracked. All preparation and training jobs must receive its
+absolute path through `FOUR_SUITE_HPC_ENV_FILE`.
+
+## 4. Prepare and preflight
+
+Preparation rebuilds small portable indices on the HPC filesystem and rewrites
+legacy cache paths. Do not copy a prepared artifact directory from another
+machine.
 
 ```bash
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 uv run scripts/train.py pi05_libero --exp-name=my_experiment --overwrite
+cd "$LIBERO40_ROOT/libero_task_related/experiments/four_suite_joint"
+source hpc.env
+
+./jobs/run_8gpu.sh prepare --target-scope task_relevant
+./jobs/run_8gpu.sh preflight \
+  --variant trqc --num-train-steps 30000 --warmup-steps 10000
+./jobs/run_8gpu.sh preflight \
+  --variant no_query_access --num-train-steps 30000 --warmup-steps 10000
 ```
 
-The command will log training progress to the console and save checkpoints to the `checkpoints` directory. You can also monitor training progress on the Weights & Biases dashboard. For maximally using the GPU memory, set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` before running training -- this enables JAX to use up to 90% of the GPU memory (vs. the default of 75%).
-
-**Note:** We provide functionality for *reloading* normalization statistics for state / action normalization from pre-training. This can be beneficial if you are fine-tuning to a new task on a robot that was part of our pre-training mixture. For more details on how to reload normalization statistics, see the [norm_stats.md](docs/norm_stats.md) file.
-
-### 3. Spinning up a policy server and running inference
-
-Once training is complete, we can run inference by spinning up a policy server and then querying it from a LIBERO evaluation script. Launching a model server is easy (we use the checkpoint for iteration 20,000 for this example, modify as needed):
+Both preflights are read-only and report `optimizer_steps_executed: 0`. Then
+verify the actual Slurm node, environment, and eight-GPU visibility:
 
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint --policy.config=pi05_libero --policy.dir=checkpoints/pi05_libero/my_experiment/20000
+sbatch --account=ACCOUNT --partition=PARTITION --time=00:30:00 --mem=64G \
+  --export=ALL,FOUR_SUITE_HPC_ENV_FILE="$PWD/hpc.env" \
+  jobs/slurm_8gpu.sbatch test
 ```
 
-This will spin up a server that listens on port 8000 and waits for observations to be sent to it. We can then run an evaluation script (or robot runtime) that queries the server.
+Use site-specific account, partition, wall-time, and memory values. The Slurm
+launcher itself requests one node, eight GPUs, and 64 CPU cores.
 
-For running the LIBERO eval in particular, we provide (and recommend using) a Dockerized workflow that handles both the policy server and the evaluation script together. See the [LIBERO README](examples/libero/README.md) for more details.
+## 5. Run the frozen experiments
 
-If you want to embed a policy server call in your own robot runtime, we have a minimal example of how to do so in the [remote inference docs](docs/remote_inference.md).
-
-
-
-### More Examples
-
-We provide more examples for how to fine-tune and run inference with our models on the ALOHA platform in the following READMEs:
-- [ALOHA Simulator](examples/aloha_sim)
-- [ALOHA Real](examples/aloha_real)
-- [UR5](examples/ur5)
-
-## PyTorch Support
-
-openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongside the original JAX versions! The PyTorch implementation has been validated on the LIBERO benchmark (both inference and finetuning). A few features are currently not supported (this may change in the future):
-
-- The π₀-FAST model
-- Mixed precision training
-- FSDP (fully-sharded data parallelism) training
-- LoRA (low-rank adaptation) training
-- EMA (exponential moving average) weights during training
-
-### Setup
-1. Make sure that you have the latest version of all dependencies installed: `uv sync`
-
-2. Double check that you have transformers 4.53.2 installed: `uv pip show transformers`
-
-3. Apply the transformers library patches:
-   ```bash
-   cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
-   ```
-
-This overwrites several files in the transformers library with necessary model changes: 1) supporting AdaRMS, 2) correctly controlling the precision of activations, and 3) allowing the KV cache to be used without being updated.
-
-**WARNING**: With the default uv link mode (hardlink), this will permanently affect the transformers library in your uv cache, meaning the changes will survive reinstallations of transformers and could even propagate to other projects that use transformers. To fully undo this operation, you must run `uv cache clean transformers`.
-
-### Converting JAX Models to PyTorch
-
-To convert a JAX model checkpoint to PyTorch format:
+Only set the approval variable for a reviewed formal optimizer job. The main
+method is launched as follows:
 
 ```bash
-uv run examples/convert_jax_model_to_pytorch.py \
-    --checkpoint_dir /path/to/jax/checkpoint \
-    --config_name <config name> \
-    --output_path /path/to/converted/pytorch/checkpoint
+sbatch --account=ACCOUNT --partition=PARTITION --time=TIME --mem=MEMORY \
+  --export=ALL,FOUR_SUITE_HPC_ENV_FILE="$PWD/hpc.env",FOUR_SUITE_FULL_TRAINING_APPROVED=YES \
+  jobs/slurm_8gpu.sbatch train \
+    --variant trqc \
+    --exp-name libero40_trqc_seed42 \
+    --num-train-steps 30000 \
+    --warmup-steps 10000 \
+    --seed 42 \
+    --batch-size 256 \
+    --disable-wandb
 ```
 
-### Running Inference with PyTorch
+Run the query-access ablation by changing only these arguments:
 
-The PyTorch implementation uses the same API as the JAX version - you only need to change the checkpoint path to point to the converted PyTorch model:
-
-```python
-from openpi.training import config as _config
-from openpi.policies import policy_config
-from openpi.shared import download
-
-config = _config.get_config("pi05_droid")
-checkpoint_dir = "/path/to/converted/pytorch/checkpoint"
-
-# Create a trained policy (automatically detects PyTorch format)
-policy = policy_config.create_trained_policy(config, checkpoint_dir)
-
-# Run inference (same API as JAX)
-action_chunk = policy.infer(example)["actions"]
+```text
+--variant no_query_access --exp-name libero40_no_query_access_seed42
 ```
 
-### Policy Server with PyTorch
+Do not add `--overwrite` to an existing experiment. Use `--resume` only when
+resuming the same configuration and checkpoint directory.
 
-The policy server works identically with PyTorch models - just point to the converted checkpoint directory:
+## Whole-scene ablation status
+
+The code path and cache generators for `whole_scene` are included, but the
+frozen `task-relevant-v1` asset tag does not contain Whole-scene Geometry or
+Motion. The preparation gate will fail if those assets are absent; it never
+falls back to task-relevant targets.
+
+After a separately validated Whole-scene asset release is published, download
+that pinned tag, point `FOUR_SUITE_WHOLE_SCENE_GEOMETRY_ROOT` and
+`FOUR_SUITE_WHOLE_SCENE_MOTION_ROOT` at its cache directories, and run:
 
 ```bash
-uv run scripts/serve_policy.py policy:checkpoint \
-    --policy.config=pi05_droid \
-    --policy.dir=/path/to/converted/pytorch/checkpoint
+source hpc.env
+./jobs/run_8gpu.sh prepare --target-scope whole_scene
+./jobs/run_8gpu.sh preflight \
+  --variant whole_scene --num-train-steps 30000 --warmup-steps 10000
 ```
 
-### Finetuning with PyTorch
+Only after that preflight passes should the formal command use:
 
-To finetune a model in PyTorch:
-
-1. Convert the JAX base model to PyTorch format:
-   ```bash
-   uv run examples/convert_jax_model_to_pytorch.py \
-       --config_name <config name> \
-       --checkpoint_dir /path/to/jax/base/model \
-       --output_path /path/to/pytorch/base/model
-   ```
-
-2. Specify the converted PyTorch model path in your config using `pytorch_weight_path`
-
-3. Launch training using one of these modes:
-
-```bash
-# Single GPU training:
-uv run scripts/train_pytorch.py <config_name> --exp_name <run_name> --save_interval <interval>
-
-# Example:
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test
-uv run scripts/train_pytorch.py debug --exp_name pytorch_test --resume  # Resume from latest checkpoint
-
-# Multi-GPU training (single node):
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=<num_gpus> scripts/train_pytorch.py <config_name> --exp_name <run_name>
-
-# Example:
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test
-uv run torchrun --standalone --nnodes=1 --nproc_per_node=2 scripts/train_pytorch.py pi0_aloha_sim --exp_name pytorch_ddp_test --resume
-
-# Multi-Node Training:
-uv run torchrun \
-    --nnodes=<num_nodes> \
-    --nproc_per_node=<gpus_per_node> \
-    --node_rank=<rank_of_node> \
-    --master_addr=<master_ip> \
-    --master_port=<port> \
-    scripts/train_pytorch.py <config_name> --exp_name=<run_name> --save_interval <interval>
+```text
+--variant whole_scene --exp-name libero40_whole_scene_seed42
 ```
 
-### Precision Settings
-
-JAX and PyTorch implementations handle precision as follows:
-
-**JAX:**
-1. Inference: most weights and computations in bfloat16, with a few computations in float32 for stability
-2. Training: defaults to mixed precision: weights and gradients in float32, (most) activations and computations in bfloat16. You can change to full float32 training by setting `dtype` to float32 in the config.
-
-**PyTorch:**
-1. Inference: matches JAX -- most weights and computations in bfloat16, with a few weights converted to float32 for stability
-2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. Mixed precision is not yet supported.
-
-With torch.compile, inference speed is comparable between JAX and PyTorch.
-
-## Troubleshooting
-
-We will collect common issues and their solutions here. If you encounter an issue, please check here first. If you can't find a solution, please file an issue on the repo (see [here](CONTRIBUTING.md) for guidelines).
-
-| Issue                                     | Resolution                                                                                                                                                                                   |
-| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `uv sync` fails with dependency conflicts | Try removing the virtual environment directory (`rm -rf .venv`) and running `uv sync` again. If issues persist, check that you have the latest version of `uv` installed (`uv self update`). |
-| Training runs out of GPU memory           | Make sure you set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` (or higher) before running training to allow JAX to use more GPU memory. You can also use `--fsdp-devices <n>` where `<n>` is your number of GPUs, to enable [fully-sharded data parallelism](https://engineering.fb.com/2021/07/15/open-source/fsdp/), which reduces memory usage in exchange for slower training (the amount of slowdown depends on your particular setup). If you are still running out of memory, you may want to consider disabling EMA.        |
-| Policy server connection errors           | Check that the server is running and listening on the expected port. Verify network connectivity and firewall settings between client and server.                                            |
-| Missing norm stats error when training    | Run `scripts/compute_norm_stats.py` with your config name before starting training.                                                                                                          |
-| Dataset download fails                    | Check your internet connection. For HuggingFace datasets, ensure you're logged in (`huggingface-cli login`).                                                                                 |
-| CUDA/GPU errors                           | Verify NVIDIA drivers are installed correctly. For Docker, ensure nvidia-container-toolkit is installed. Check GPU compatibility. You do NOT need CUDA libraries installed at a system level --- they will be installed via uv. You may even want to try *uninstalling* system CUDA libraries if you run into CUDA issues, since system libraries can sometimes cause conflicts. |
-| Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |
-| Action dimensions mismatch                | Verify your data processing transforms match the expected input/output dimensions of your robot. Check the action space definitions in your policy classes.                                  |
-| Diverging training loss                            | Check the `q01`, `q99`, and `std` values in `norm_stats.json` for your dataset. Certain dimensions that are rarely used can end up with very small `q01`, `q99`, or `std` values, leading to huge states and actions after normalization. You can manually adjust the norm stats as a workaround. |
+The only authoritative instructions for this release branch are this README
+and the checked-in `experiments/four_suite_joint/hpc.env.example` template.

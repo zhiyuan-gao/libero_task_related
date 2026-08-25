@@ -408,7 +408,7 @@ def create_rlds_data_loader(
 ) -> DataLoader[tuple[_model.Observation, _model.Actions]]:
     """Create an RLDS data loader for training.
 
-    Note: This data loader requires some extra dependencies -- see examples/droid/README_train.md
+    Note: This data loader requires optional DROID-specific dependencies.
 
     Args:
         data_config: The data configuration.
