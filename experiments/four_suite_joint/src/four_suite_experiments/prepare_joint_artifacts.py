@@ -211,15 +211,43 @@ def _absolute_path(value: object, source_index: Path) -> object:
         if candidate.is_file():
             return str(candidate.resolve(strict=True))
     raise FileNotFoundError(
-        "target path is unavailable and cannot be rebased below "
-        f"{source_index.parent}: {path}"
+        f"target path is unavailable and cannot be rebased below {source_index.parent}: {path}"
     )
 
 
-def build_geometry_index(paths: tuple[Path, Path]) -> pd.DataFrame:
+def _validate_source_scope(
+    frame: pd.DataFrame,
+    *,
+    expected_scope: str,
+    source_index: Path,
+) -> None:
+    if expected_scope not in ("task_relevant", "whole_scene"):
+        raise ValueError(f"unsupported target scope: {expected_scope}")
+    if "target_scope" not in frame:
+        if expected_scope == "whole_scene":
+            raise ValueError(
+                f"Whole-scene source index lacks an explicit target_scope: {source_index}"
+            )
+        return
+    observed = set(frame["target_scope"].dropna().astype(str))
+    if observed != {expected_scope}:
+        raise ValueError(
+            f"source target scope differs: expected={expected_scope}, "
+            f"observed={sorted(observed)}, index={source_index}"
+        )
+
+
+def build_geometry_index(
+    paths: tuple[Path, ...], *, target_scope: str = "task_relevant"
+) -> pd.DataFrame:
     parts = []
     for path in paths:
         part = pd.read_parquet(path).copy()
+        _validate_source_scope(
+            part,
+            expected_scope=target_scope,
+            source_index=path,
+        )
         if "target_memmap_path" not in part:
             raise ValueError(f"Geometry index lacks target_memmap_path: {path}")
         part["target_memmap_path"] = part["target_memmap_path"].map(
@@ -256,10 +284,17 @@ def build_geometry_index(paths: tuple[Path, Path]) -> pd.DataFrame:
     return frame
 
 
-def build_motion_index(paths: tuple[Path, Path]) -> pd.DataFrame:
+def build_motion_index(
+    paths: tuple[Path, ...], *, target_scope: str = "task_relevant"
+) -> pd.DataFrame:
     parts = []
     for path in paths:
         part = pd.read_parquet(path).copy()
+        _validate_source_scope(
+            part,
+            expected_scope=target_scope,
+            source_index=path,
+        )
         part["target_shard_path"] = part["target_shard_path"].map(
             lambda value, source=path: _absolute_path(value, source)
         )
@@ -295,8 +330,14 @@ def prepare(paths: SourcePaths, *, force: bool = False) -> ArtifactPaths:
     manifest_sha = sha256_file(paths.joint_manifest)
     manifest = _validate_manifest(pd.read_parquet(paths.joint_manifest))
     mapping = build_episode_mapping(manifest, paths.lerobot_root, manifest_sha)
-    geometry = build_geometry_index(paths.geometry_indices)
-    motion = build_motion_index(paths.motion_indices)
+    geometry = build_geometry_index(
+        paths.geometry_indices,
+        target_scope=paths.target_scope,
+    )
+    motion = build_motion_index(
+        paths.motion_indices,
+        target_scope=paths.target_scope,
+    )
 
     manifest_identity = manifest[["lerobot_dataset_index", "sample_id"]]
     if not geometry[["lerobot_dataset_index", "sample_id"]].equals(manifest_identity):
@@ -336,7 +377,7 @@ def prepare(paths: SourcePaths, *, force: bool = False) -> ArtifactPaths:
     provenance = {
         "schema": "four_suite_joint_artifact_provenance_v1",
         "status": "PASS",
-        "target_scope": "task_relevant",
+        "target_scope": paths.target_scope,
         "hf_repo_id": LIBERO_REPO_ID,
         "hf_revision": LIBERO_REVISION,
         "episode_count": FOUR_SUITE_EPISODES,
@@ -358,9 +399,14 @@ def prepare(paths: SourcePaths, *, force: bool = False) -> ArtifactPaths:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact-dir", type=Path)
+    parser.add_argument(
+        "--target-scope",
+        choices=("task_relevant", "whole_scene"),
+        default="task_relevant",
+    )
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
-    paths = SourcePaths.defaults(args.artifact_dir)
+    paths = SourcePaths.defaults(args.artifact_dir, target_scope=args.target_scope)
     output = prepare(paths, force=args.force)
     print(json.dumps({"status": "PASS", "artifact_dir": str(output.root)}, indent=2))
 

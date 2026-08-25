@@ -1,7 +1,7 @@
 # From-zero Slurm HPC setup
 
 This runbook assumes a single Slurm node with eight 80 GB GPUs. It prepares the
-four-suite B-Geo0.05 release but does not authorize or launch formal training.
+LIBERO-40 TRQC release but does not authorize or launch formal training.
 Replace every `REPLACE_*` value with the site's real account, partition, login,
 and persistent scratch paths.
 
@@ -41,7 +41,7 @@ Use persistent scratch, not node-local temporary storage:
 mkdir -p /scratch/REPLACE_USER/libero40
 cd /scratch/REPLACE_USER/libero40
 git clone \
-  --branch four-suite-b-geo005-release \
+  --branch libero40-task-relevant-query-conditioning-release \
   --recurse-submodules \
   https://github.com/zhiyuan-gao/libero_task_related.git
 cd libero_task_related
@@ -157,14 +157,37 @@ cd /scratch/REPLACE_USER/libero40/libero_task_related/experiments/four_suite_joi
 cp hpc.env.example hpc.env
 # Edit every REPLACE_* path in hpc.env, then:
 source hpc.env
-./jobs/run_8gpu.sh prepare
-./jobs/run_8gpu.sh preflight --variant main
-./jobs/run_8gpu.sh preflight --variant supervision_only
+./jobs/run_8gpu.sh prepare --target-scope task_relevant
+./jobs/run_8gpu.sh preflight --variant trqc
+./jobs/run_8gpu.sh preflight --variant no_query_access
 ```
 
-Both preflights must report `status: PASS`, `training_data_ready: true`, and
+Both task-relevant preflights must report `status: PASS`, `training_data_ready: true`, and
 `optimizer_steps_executed: 0`. The `prepare` command rebases stale absolute
 Motion shard paths onto the transferred HPC cache and refuses unresolved paths.
+
+After both Whole-scene caches are transferred, prepare and validate their
+independent bundle:
+
+```bash
+./jobs/run_8gpu.sh prepare --target-scope whole_scene
+./jobs/run_8gpu.sh preflight --variant whole_scene
+```
+
+The two eventual cache roots to transfer are:
+
+```text
+/workspace/vla/p3/workspace/data/libero_four_suite_annotation/policy_aux_v1/
+  geometry_whole_scene_four_suite_v1/
+/workspace/vla/p3/workspace/data/libero_four_suite_annotation/policy_aux_v1/
+  motion_whole_scene_four_suite_v1/
+```
+
+Copy each directory under the HPC
+`assets/annotation/policy_aux_v1/` directory with `rsync -a --partial`, then
+repeat with `--checksum --dry-run --itemize-changes`. Do not transfer either
+cache until its `cache_validation.json` reports `status: PASS`. The TRQC and No
+Query Access runs do not require these Whole-scene caches.
 
 ## 6. Slurm submission
 
@@ -211,9 +234,9 @@ Approximate persistent allocation:
 | official LeRobot snapshot | 32.54 GiB |
 | transferred frozen assets | 17.89 GiB |
 | three resumable checkpoints for one run | about 60 GB |
-| three resumable checkpoints for both variants | about 120 GB |
+| three resumable checkpoints for all three variants | about 180 GB |
 | temporary checkpoint write and safety margin | at least 20-40 GB |
 
-A complete two-variant campaign should reserve at least 220 GB; 250 GB is the
-recommended minimum. A full checkpoint includes roughly 7.5 GB model weights
+A complete three-variant campaign should reserve at least 300 GB; 320 GB is the
+recommended minimum if checkpoints from all runs coexist. A full checkpoint includes roughly 7.5 GB model weights
 and 14 GB optimizer state, so budgeting only for `model.safetensors` is unsafe.

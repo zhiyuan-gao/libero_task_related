@@ -29,6 +29,7 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
 
     expected_episodes: int = FOUR_SUITE_EPISODES
     expected_frames: int = FOUR_SUITE_FRAMES
+    target_scope: str = "task_relevant"
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -42,6 +43,10 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
         if self.motion_target_count != FOUR_SUITE_MOTION_VALID:
             raise ValueError(
                 f"four-suite Motion count must be {FOUR_SUITE_MOTION_VALID}"
+            )
+        if self.target_scope not in ("task_relevant", "whole_scene"):
+            raise ValueError(
+                f"unsupported four-suite target scope: {self.target_scope}"
             )
 
     def _validated_mapping_records(self) -> list[dict]:

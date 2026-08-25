@@ -1,26 +1,28 @@
-# Four-suite B-Geo0.05 experiment plan
+# LIBERO-40 Task-Relevant Query Conditioning experiment plan
 
 Status: code-release preparation, 2026-08-25. This document defines future
 four-suite runs and contains no prior experiment results.
 
 ## Scientific question
 
-With identical task-relevant Semantic, Geometry, and Motion auxiliary
-supervision, does allowing the Action Expert to read the learned Geometry and
-Motion queries improve policy success compared with auxiliary regularization of
-the shared backbone alone?
+Two matched questions are tested: does restricting Geometry/Motion supervision
+to task-relevant regions help compared with Whole-scene targets, and does
+allowing the Action Expert to read the learned Geometry/Motion queries improve
+policy success compared with auxiliary regularization of the shared backbone
+alone?
 
 This comparison does not by itself establish improvement over unmodified
 pi0.5; no pi0.5 baseline is scheduled in this plan.
 
 ## Required runs
 
-| Run | Supervision | Action reads Geometry/Motion | Purpose |
+| Run | Geometry / Motion scope | Action reads Geometry/Motion | Purpose |
 |---|---|---|---|
-| B-Geo0.05 Main | Semantic + Geometry + Motion | Yes / Yes | Main four-suite method |
-| B-Geo0.05 Supervision-only | Identical | No / No | Isolate latent conditioning from shared-backbone regularization |
+| TRQC (Ours) | Task-relevant / Task-relevant | Yes / Yes | Main four-suite method |
+| TRQC — Whole-Scene Geo+Motion | Whole-scene / Whole-scene | Yes / Yes | Spatial-scope ablation |
+| TRQC — No Query Access | Task-relevant / Task-relevant | No / No | Isolate query conditioning from shared-backbone regularization |
 
-Both runs use:
+All three runs use:
 
 - `lambda_sem=0.01`, `lambda_geo=0.05`, `lambda_motion=0.05`
 - no Ground query, target, head, or loss
@@ -30,8 +32,10 @@ Both runs use:
 - global batch 256 on 8 GPUs
 - the same seed, sampler, LR schedule, update budget, and evaluation protocol
 
-The only experimental difference is whether Action-to-Geometry/Motion attention
-edges are enabled during both training and deployment.
+Semantic supervision remains identical and task-relevant in all three runs.
+The Whole-scene variant changes only Geometry/Motion pooling and their train-only
+normalization. The No Query Access variant changes only Action-to-Geometry/Motion
+attention edges during both training and deployment.
 
 ## Data contract
 
@@ -57,10 +61,10 @@ the recommended candidate, not authorization to launch.
 - Freeze the primary checkpoint-selection rule before evaluation.
 - Do not choose the paper checkpoint by maximizing the final test rollouts.
 - Use paired rollout seeds, task counts, initial states, and environment settings
-  across both training variants.
+  across all three training variants.
 - Report LIBERO-Spatial, Object, Goal, LIBERO-10, and their macro average.
-- A Supervision-only checkpoint must be served with both query groups blocked.
-- For the Main checkpoint, optional inference interventions may block Geometry,
+- A No Query Access checkpoint must be served with both query groups blocked.
+- For the TRQC checkpoint, optional inference interventions may block Geometry,
   Motion, or both, but must be explicitly recorded in the evaluation manifest.
 
 ## Launch requirements
@@ -69,8 +73,8 @@ Formal training remains blocked until all of the following pass:
 
 1. all 1,693 LeRobot episode parquet files are present;
 2. transferred auxiliary targets and FP32 base pass checksum verification;
-3. portable metadata preparation and static preflight pass;
-4. both variants pass a real batch forward/backward check;
-5. both variants pass a short 8-GPU optimizer preflight;
+3. scope-specific portable metadata preparation and static preflight pass;
+4. all three variants pass a real batch forward/backward check;
+5. all three variants pass a short 8-GPU optimizer preflight;
 6. checkpoint retention and available storage are frozen;
 7. the researcher explicitly approves the formal run.

@@ -1,5 +1,5 @@
 {
-  "schema": "four_suite_b_geo005_experiment_matrix_v1",
+  "schema": "libero40_trqc_experiment_matrix_v1",
   "updated_utc": "2026-08-25",
   "population": {
     "repo_id": "physical-intelligence/libero",
@@ -10,16 +10,26 @@
   },
   "training_runs": [
     {
-      "id": "b_geo005_main",
-      "variant": "main",
+      "id": "trqc",
+      "variant": "trqc",
       "supervision": ["semantic", "geometry", "motion"],
+      "target_scope": {"semantic": "task_relevant", "geometry": "task_relevant", "motion": "task_relevant"},
       "action_access": ["context", "geometry", "motion"],
       "status": "STATIC_PREFLIGHT_ONLY"
     },
     {
-      "id": "b_geo005_supervision_only",
-      "variant": "supervision_only",
+      "id": "trqc_whole_scene_geometry_motion",
+      "variant": "whole_scene",
       "supervision": ["semantic", "geometry", "motion"],
+      "target_scope": {"semantic": "task_relevant", "geometry": "whole_scene", "motion": "whole_scene"},
+      "action_access": ["context", "geometry", "motion"],
+      "status": "CODE_READY_CACHE_PENDING"
+    },
+    {
+      "id": "trqc_no_query_access",
+      "variant": "no_query_access",
+      "supervision": ["semantic", "geometry", "motion"],
+      "target_scope": {"semantic": "task_relevant", "geometry": "task_relevant", "motion": "task_relevant"},
       "action_access": ["context"],
       "status": "STATIC_PREFLIGHT_ONLY"
     }
@@ -35,7 +45,6 @@
     "P1/P2/P3",
     "Binary Ground",
     "Geometry-conditioned Motion",
-    "whole-scene targets",
     "previous experiment reports"
   ]
 }

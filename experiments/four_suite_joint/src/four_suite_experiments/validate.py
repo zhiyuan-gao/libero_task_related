@@ -163,9 +163,11 @@ def validate_lerobot_snapshot(root: Path, *, require_complete: bool) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument(
-        "--variant", choices=("main", "supervision_only"), required=True
+        "--variant",
+        choices=("trqc", "whole_scene", "no_query_access"),
+        required=True,
     )
     parser.add_argument(
         "--num-train-steps",
@@ -175,11 +177,10 @@ def main() -> None:
     )
     parser.add_argument("--warmup-steps", type=int, default=1)
     args = parser.parse_args()
-    artifacts = ArtifactPaths(args.artifact_dir.resolve())
-    source_paths = SourcePaths.defaults(args.artifact_dir)
-    report = validate_artifacts(
-        artifacts, target_scope=expected_target_scope(args.variant)
-    )
+    target_scope = expected_target_scope(args.variant)
+    source_paths = SourcePaths.defaults(args.artifact_dir, target_scope=target_scope)
+    artifacts = ArtifactPaths(source_paths.artifact_dir)
+    report = validate_artifacts(artifacts, target_scope=target_scope)
     report.update(
         validate_lerobot_snapshot(source_paths.lerobot_root, require_complete=False)
     )
@@ -197,6 +198,7 @@ def main() -> None:
     report.update(
         {
             "variant": args.variant,
+            "target_scope": target_scope,
             "blocked_action_groups": sorted(blocked_action_groups(args.variant)),
             "config_name": config.name,
             "optimizer_steps_executed": 0,

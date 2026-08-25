@@ -36,9 +36,11 @@ def _load_upstream_trainer(openpi_root: Path):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--variant", choices=("main", "supervision_only"), required=True
+        "--variant",
+        choices=("trqc", "whole_scene", "no_query_access"),
+        required=True,
     )
-    parser.add_argument("--artifact-dir", type=Path, required=True)
+    parser.add_argument("--artifact-dir", type=Path)
     parser.add_argument("--exp-name", required=True)
     parser.add_argument("--num-train-steps", type=int, required=True)
     parser.add_argument("--warmup-steps", type=int, required=True)
@@ -58,11 +60,10 @@ def main() -> None:
         raise PermissionError(
             "Refusing optimizer work. Freeze the budget, then set FOUR_SUITE_FULL_TRAINING_APPROVED=YES."
         )
-    artifacts = ArtifactPaths(args.artifact_dir.resolve())
-    preflight = validate_artifacts(
-        artifacts, target_scope=expected_target_scope(args.variant)
-    )
-    source_paths = SourcePaths.defaults(args.artifact_dir)
+    target_scope = expected_target_scope(args.variant)
+    source_paths = SourcePaths.defaults(args.artifact_dir, target_scope=target_scope)
+    artifacts = ArtifactPaths(source_paths.artifact_dir)
+    preflight = validate_artifacts(artifacts, target_scope=target_scope)
     validate_lerobot_snapshot(source_paths.lerobot_root, require_complete=True)
     config = build_train_config(
         variant=args.variant,
@@ -83,18 +84,23 @@ def main() -> None:
     )
     base_model_file = Path(config.pytorch_weight_path) / "model.safetensors"
     if not base_model_file.is_file():
-        raise FileNotFoundError(f"strict FP32-converted base is missing: {base_model_file}")
+        raise FileNotFoundError(
+            f"strict FP32-converted base is missing: {base_model_file}"
+        )
     norm_stats_file = (
         Path(config.data.assets.assets_dir)
         / "physical-intelligence/libero/norm_stats.json"
     )
     if not norm_stats_file.is_file():
-        raise FileNotFoundError(f"LIBERO normalization assets are missing: {norm_stats_file}")
+        raise FileNotFoundError(
+            f"LIBERO normalization assets are missing: {norm_stats_file}"
+        )
     install_data_overlay()
     install_action_access_policy(blocked_action_groups(args.variant))
     launch_manifest = {
         "preflight": preflight,
         "variant": args.variant,
+        "target_scope": target_scope,
         "exp_name": args.exp_name,
         "num_train_steps": args.num_train_steps,
         "warmup_steps": args.warmup_steps,

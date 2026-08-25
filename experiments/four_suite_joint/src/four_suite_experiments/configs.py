@@ -1,4 +1,4 @@
-"""Construct four-suite B-Geo0.05 configs from the reviewed B recipe."""
+"""Construct the three frozen LIBERO-40 TRQC experiment variants."""
 
 from __future__ import annotations
 
@@ -13,21 +13,26 @@ from .constants import FOUR_SUITE_MOTION_VALID
 from .data_overlay import FourSuitePolicyAuxTrainConfig
 from .paths import ArtifactPaths
 
-Variant = Literal["main", "supervision_only"]
+Variant = Literal["trqc", "whole_scene", "no_query_access"]
 BASE_CONFIG_NAME = "pi05_libero3_semantic_geometry_motion_aux"
+CONFIG_NAMES: dict[Variant, str] = {
+    "trqc": "pi05_libero40_trqc",
+    "whole_scene": "pi05_libero40_trqc_whole_scene_geometry_motion",
+    "no_query_access": "pi05_libero40_trqc_no_query_access",
+}
 
 
 def blocked_action_groups(variant: Variant) -> frozenset[str]:
-    if variant == "supervision_only":
+    if variant == "no_query_access":
         return frozenset({"geometry", "motion"})
-    if variant == "main":
+    if variant in ("trqc", "whole_scene"):
         return frozenset()
     raise ValueError(f"unsupported four-suite variant: {variant}")
 
 
 def expected_target_scope(variant: Variant) -> str:
     blocked_action_groups(variant)
-    return "task_relevant"
+    return "whole_scene" if variant == "whole_scene" else "task_relevant"
 
 
 def build_train_config(
@@ -78,6 +83,7 @@ def build_train_config(
         ),
     )
     policy_aux = FourSuitePolicyAuxTrainConfig(
+        target_scope=expected_target_scope(variant),
         mode="semantic_geometry_motion",
         policy_manifest_path=str(artifacts.policy_manifest.resolve()),
         episode_mapping_path=str(artifacts.episode_mapping.resolve()),
@@ -100,7 +106,7 @@ def build_train_config(
     schedule = dataclasses.replace(base.lr_schedule, warmup_steps=warmup_steps)
     return dataclasses.replace(
         base,
-        name=f"pi05_libero40_b_geo005_{variant}_aux",
+        name=CONFIG_NAMES[variant],
         exp_name=exp_name,
         data=data,
         policy_aux=policy_aux,

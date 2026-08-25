@@ -1,4 +1,4 @@
-# Four-suite B-Geo0.05 release
+# LIBERO-40 Task-Relevant Query Conditioning release
 
 This directory contains only the code and protocol for joint training on the
 official 40-task LIBERO population. It does not contain earlier experiment
@@ -7,19 +7,33 @@ teacher targets.
 
 ## Method
 
-The main method is the reviewed B-Geo0.05 architecture:
+The main method is Task-Relevant Query Conditioning (TRQC):
 
 ```text
 Action + 0.01 Semantic + 0.05 Geometry + 0.05 Motion
 ```
 
 - Geometry and Motion each use eight independent learned queries.
-- The Action Expert reads both query groups in the `main` variant.
-- `supervision_only` keeps the same queries, heads, losses, parameters, data,
+- The Action Expert reads both query groups in the `trqc` and `whole_scene`
+  variants.
+- `no_query_access` keeps the same queries, heads, losses, parameters, data,
   and gradients, but blocks only Action-to-Geometry/Motion attention.
 - Ground queries and Ground loss are absent. This is not P3.
 - Training initializes from the strict FP32-converted pi0.5 base, runs in BF16,
   and does not use EMA.
+
+The frozen experiment family has three variants:
+
+- `trqc`: task-relevant Semantic, Geometry, and Motion; Action reads the
+  Geometry/Motion queries.
+- `whole_scene`: identical Semantic and query access, but both Geometry and
+  Motion use independently normalized Whole-scene targets.
+- `no_query_access`: identical task-relevant targets and losses to `trqc`, but
+  Action-to-Geometry/Motion attention is blocked.
+
+The matched Whole-scene teacher recipes are documented in
+[`WHOLE_SCENE_MOTION.md`](WHOLE_SCENE_MOTION.md) and
+[`WHOLE_SCENE_GEOMETRY.md`](WHOLE_SCENE_GEOMETRY.md).
 
 ## Frozen population
 
@@ -83,13 +97,13 @@ HPC with:
 
 ## Prepare portable metadata
 
-Generated indices contain absolute target-store paths. Run `prepare` once on
-the HPC filesystem after transferring the auxiliary bundle:
+Generated indices contain absolute target-store paths. Run `prepare` once per
+target scope on the HPC filesystem after transferring that auxiliary bundle:
 
 ```bash
-./jobs/run_8gpu.sh prepare
-./jobs/run_8gpu.sh preflight --variant main
-./jobs/run_8gpu.sh preflight --variant supervision_only
+./jobs/run_8gpu.sh prepare --target-scope task_relevant
+./jobs/run_8gpu.sh preflight --variant trqc
+./jobs/run_8gpu.sh preflight --variant no_query_access
 ```
 
 `prepare` performs CPU-only metadata joins and pooled train normalization. It
@@ -97,6 +111,16 @@ does not run VGGT, Track4World, or any other teacher. Static preflight validates
 artifacts and configuration but performs zero optimizer updates. A real
 forward/backward and short multi-GPU preflight is still required before formal
 training.
+
+Only after both Whole-scene caches have been generated or transferred:
+
+```bash
+./jobs/run_8gpu.sh prepare --target-scope whole_scene
+./jobs/run_8gpu.sh preflight --variant whole_scene
+```
+
+There is no fallback between target scopes: missing Whole-scene assets stop the
+command instead of silently using task-relevant targets.
 
 ## Formal training gate
 
@@ -107,21 +131,22 @@ environment variable. The matched-epoch candidate is 30,000 updates with
 ```bash
 export FOUR_SUITE_FULL_TRAINING_APPROVED=YES
 ./jobs/run_8gpu.sh train \
-  --variant main \
-  --exp-name libero40_b_geo005_main_seed42 \
+  --variant trqc \
+  --exp-name libero40_trqc_seed42 \
   --num-train-steps 30000 \
   --warmup-steps 10000
 ```
 
-Run `supervision_only` with the identical seed, update count, warmup, batch,
-optimizer, and target bundle. The current release retains the latest three full
-resume checkpoints at a 1,000-update cadence; revise this only after storage and
+Run `whole_scene` and `no_query_access` with the identical seed, update count,
+warmup, batch, optimizer, and checkpoint policy. `whole_scene` intentionally
+uses its own Geometry/Motion artifact bundle; the other two variants share the
+task-relevant bundle. The current release retains the latest three full resume
+checkpoints at a 1,000-update cadence; revise this only after storage and
 checkpoint-selection policy are frozen.
 
 ## Deliberately out of scope
 
 - P1, P2, P3, Binary Ground, and Geometry-conditioned Motion experiments
-- Whole-scene targets
 - Prior training/evaluation reports and numerical results
 - Diagnostic and tiny-overfit scripts
 - Generated caches, checkpoints, logs, and videos

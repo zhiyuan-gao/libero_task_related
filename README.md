@@ -1,6 +1,6 @@
 # openpi
 
-> This release branch's LIBERO four-suite B-Geo0.05 code and protocol live in
+> This release branch's LIBERO-40 Task-Relevant Query Conditioning (TRQC) code and protocol live in
 > [`experiments/four_suite_joint`](experiments/four_suite_joint/README.md).
 > Generated targets, checkpoints, results, diagnostics, and prior experiment
 > reports are intentionally excluded.

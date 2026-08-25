@@ -10,6 +10,7 @@ from .constants import LIBERO_REVISION
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 REPO_ROOT = PROJECT_ROOT.parents[1]
+TARGET_SCOPES = ("task_relevant", "whole_scene")
 
 
 def _env_path(name: str, default: str | Path) -> Path:
@@ -18,24 +19,68 @@ def _env_path(name: str, default: str | Path) -> Path:
 
 @dataclass(frozen=True)
 class SourcePaths:
+    target_scope: str
     openpi_root: Path
     lerobot_root: Path
     joint_manifest: Path
-    geometry_indices: tuple[Path, Path]
-    geometry_normalizations: tuple[Path, Path]
-    motion_indices: tuple[Path, Path]
-    motion_normalizations: tuple[Path, Path]
+    geometry_indices: tuple[Path, ...]
+    geometry_normalizations: tuple[Path, ...]
+    motion_indices: tuple[Path, ...]
+    motion_normalizations: tuple[Path, ...]
     artifact_dir: Path
 
     @classmethod
-    def defaults(cls, artifact_dir: str | Path | None = None) -> SourcePaths:
+    def defaults(
+        cls,
+        artifact_dir: str | Path | None = None,
+        *,
+        target_scope: str = "task_relevant",
+    ) -> SourcePaths:
+        if target_scope not in TARGET_SCOPES:
+            raise ValueError(f"unsupported target scope: {target_scope}")
         external_root = PROJECT_ROOT / "external_assets"
         data_root = _env_path(
             "FOUR_SUITE_ANNOTATION_ROOT",
             external_root / "annotation",
         )
         aux_root = data_root / "policy_aux_v1"
+        if target_scope == "task_relevant":
+            geometry_roots = (
+                aux_root / "geometry_libero10",
+                aux_root / "geometry_libero_goal_object_spatial_v1",
+            )
+            motion_roots = (
+                aux_root / "motion_libero10_full_v1",
+                aux_root / "motion_libero_goal_object_spatial_v1",
+            )
+        else:
+            geometry_roots = (
+                _env_path(
+                    "FOUR_SUITE_WHOLE_SCENE_GEOMETRY_ROOT",
+                    aux_root / "geometry_whole_scene_four_suite_v1",
+                ),
+            )
+            motion_roots = (
+                _env_path(
+                    "FOUR_SUITE_WHOLE_SCENE_MOTION_ROOT",
+                    aux_root / "motion_whole_scene_four_suite_v1",
+                ),
+            )
+        if artifact_dir is None:
+            scope_env = (
+                "FOUR_SUITE_TASK_RELEVANT_ARTIFACT_DIR"
+                if target_scope == "task_relevant"
+                else "FOUR_SUITE_WHOLE_SCENE_ARTIFACT_DIR"
+            )
+            artifact_dir = os.environ.get(
+                scope_env,
+                os.environ.get(
+                    "FOUR_SUITE_ARTIFACT_DIR",
+                    str(PROJECT_ROOT / f"artifacts/{target_scope}"),
+                ),
+            )
         return cls(
+            target_scope=target_scope,
             openpi_root=_env_path("OPENPI_ROOT", REPO_ROOT),
             lerobot_root=_env_path(
                 "FOUR_SUITE_LEROBOT_ROOT",
@@ -48,33 +93,17 @@ class SourcePaths:
                 external_root
                 / "runtime_metadata/four_suite_policy_geometry_manifest.parquet",
             ),
-            geometry_indices=(
-                aux_root / "geometry_libero10/target_index.parquet",
-                aux_root
-                / "geometry_libero_goal_object_spatial_v1/target_index.parquet",
+            geometry_indices=tuple(
+                root / "target_index.parquet" for root in geometry_roots
             ),
-            geometry_normalizations=(
-                aux_root / "geometry_libero10/normalization/train_mean_std.json",
-                aux_root
-                / "geometry_libero_goal_object_spatial_v1/normalization/train_mean_std.json",
+            geometry_normalizations=tuple(
+                root / "normalization/train_mean_std.json" for root in geometry_roots
             ),
-            motion_indices=(
-                aux_root / "motion_libero10_full_v1/index.parquet",
-                aux_root / "motion_libero_goal_object_spatial_v1/index.parquet",
+            motion_indices=tuple(root / "index.parquet" for root in motion_roots),
+            motion_normalizations=tuple(
+                root / "target_statistics_train.json" for root in motion_roots
             ),
-            motion_normalizations=(
-                aux_root / "motion_libero10_full_v1/target_statistics_train.json",
-                aux_root
-                / "motion_libero_goal_object_spatial_v1/target_statistics_train.json",
-            ),
-            artifact_dir=(
-                Path(artifact_dir).expanduser().resolve()
-                if artifact_dir is not None
-                else _env_path(
-                    "FOUR_SUITE_ARTIFACT_DIR",
-                    PROJECT_ROOT / "artifacts/task_relevant",
-                )
-            ),
+            artifact_dir=Path(artifact_dir).expanduser().resolve(),
         )
 
     def required_sources(self) -> tuple[Path, ...]:

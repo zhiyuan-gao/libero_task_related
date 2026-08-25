@@ -6,7 +6,6 @@ REPO_ROOT="$(cd "${PROJECT_ROOT}/../.." && pwd)"
 OPENPI_ROOT="${OPENPI_ROOT:-${REPO_ROOT}}"
 FOUR_SUITE_PYTHON="${FOUR_SUITE_PYTHON:-${OPENPI_ROOT}/.venv/bin/python}"
 FOUR_SUITE_TORCHRUN="${FOUR_SUITE_TORCHRUN:-${OPENPI_ROOT}/.venv/bin/torchrun}"
-ARTIFACT_DIR="${FOUR_SUITE_ARTIFACT_DIR:-${PROJECT_ROOT}/artifacts/task_relevant}"
 CHECKPOINT_BASE_DIR="${FOUR_SUITE_CHECKPOINT_BASE_DIR:-${PROJECT_ROOT}/checkpoints}"
 export OPENPI_ROOT
 export PYTHONPATH="${PROJECT_ROOT}/src:${OPENPI_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
@@ -28,12 +27,10 @@ case "${command}" in
     exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.download_lerobot "$@"
     ;;
   prepare)
-    exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.prepare_joint_artifacts \
-      --artifact-dir "${ARTIFACT_DIR}" "$@"
+    exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.prepare_joint_artifacts "$@"
     ;;
   preflight)
-    exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.validate \
-      --artifact-dir "${ARTIFACT_DIR}" "$@"
+    exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.validate "$@"
     ;;
   train)
     if [[ "${FOUR_SUITE_FULL_TRAINING_APPROVED:-}" != "YES" ]]; then
@@ -45,7 +42,6 @@ case "${command}" in
       --nnodes=1 \
       --nproc_per_node=8 \
       -m four_suite_experiments.train \
-      --artifact-dir "${ARTIFACT_DIR}" \
       --checkpoint-base-dir "${CHECKPOINT_BASE_DIR}" \
       "$@"
     ;;
