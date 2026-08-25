@@ -193,10 +193,27 @@ def build_episode_mapping(
 def _absolute_path(value: object, source_index: Path) -> object:
     if pd.isna(value):
         return value
-    path = Path(str(value))
+    path = Path(str(value)).expanduser()
     if not path.is_absolute():
-        path = source_index.parent / path
-    return str(path.resolve(strict=True))
+        return str((source_index.parent / path).resolve(strict=True))
+    if path.is_file():
+        return str(path.resolve(strict=True))
+
+    # Teacher indices generated on another machine may contain an absolute
+    # shard path.  The cache directory itself is transferred intact, so rebase
+    # the suffix below the source-index directory onto its new HPC location.
+    parent_name = source_index.parent.name
+    matching_positions = [
+        index for index, part in enumerate(path.parts) if part == parent_name
+    ]
+    for position in reversed(matching_positions):
+        candidate = source_index.parent.joinpath(*path.parts[position + 1 :])
+        if candidate.is_file():
+            return str(candidate.resolve(strict=True))
+    raise FileNotFoundError(
+        "target path is unavailable and cannot be rebased below "
+        f"{source_index.parent}: {path}"
+    )
 
 
 def build_geometry_index(paths: tuple[Path, Path]) -> pd.DataFrame:

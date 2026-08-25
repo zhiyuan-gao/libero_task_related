@@ -29,21 +29,24 @@ class SourcePaths:
 
     @classmethod
     def defaults(cls, artifact_dir: str | Path | None = None) -> SourcePaths:
+        external_root = PROJECT_ROOT / "external_assets"
         data_root = _env_path(
             "FOUR_SUITE_ANNOTATION_ROOT",
-            "/workspace/vla/p3/workspace/data/libero_four_suite_annotation",
+            external_root / "annotation",
         )
         aux_root = data_root / "policy_aux_v1"
         return cls(
             openpi_root=_env_path("OPENPI_ROOT", REPO_ROOT),
             lerobot_root=_env_path(
                 "FOUR_SUITE_LEROBOT_ROOT",
-                "/workspace/vla/p3/workspace/cache/huggingface/hub/"
-                f"datasets--physical-intelligence--libero/snapshots/{LIBERO_REVISION}",
+                external_root
+                / "hf/hub/datasets--physical-intelligence--libero/snapshots"
+                / LIBERO_REVISION,
             ),
             joint_manifest=_env_path(
                 "FOUR_SUITE_JOINT_MANIFEST",
-                "/workspace/vla/p3/runtime_metadata/four_suite_policy_geometry_manifest.parquet",
+                external_root
+                / "runtime_metadata/four_suite_policy_geometry_manifest.parquet",
             ),
             geometry_indices=(
                 aux_root / "geometry_libero10/target_index.parquet",

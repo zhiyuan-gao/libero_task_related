@@ -6,3 +6,4 @@ checkpoints/
 logs/
 reports/
 videos/
+hpc.env

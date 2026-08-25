@@ -57,6 +57,11 @@ Expected auxiliary populations:
 
 ## Environment and tests
 
+For a machine that has never run this repository, follow the complete
+[`HPC_SETUP_SLURM.md`](HPC_SETUP_SLURM.md) runbook. It covers the frozen Python
+environment, exact dataset download, local-to-HPC asset transfer, integrity
+checks, path rebasing, storage, and Slurm submission.
+
 From the repository root, create the normal OpenPI environment. The launcher
 defaults to that repository and its `.venv`; both may be overridden:
 
@@ -68,6 +73,13 @@ export FOUR_SUITE_TORCHRUN=/path/to/torchrun
 ```
 
 Tests do not initialize a model or perform optimizer updates.
+
+The complete LeRobot snapshot can be downloaded and validated directly on the
+HPC with:
+
+```bash
+./jobs/run_8gpu.sh download-data --cache-dir /persistent/path/to/hf/hub
+```
 
 ## Prepare portable metadata
 

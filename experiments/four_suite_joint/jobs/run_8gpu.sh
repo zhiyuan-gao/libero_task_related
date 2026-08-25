@@ -7,7 +7,7 @@ OPENPI_ROOT="${OPENPI_ROOT:-${REPO_ROOT}}"
 FOUR_SUITE_PYTHON="${FOUR_SUITE_PYTHON:-${OPENPI_ROOT}/.venv/bin/python}"
 FOUR_SUITE_TORCHRUN="${FOUR_SUITE_TORCHRUN:-${OPENPI_ROOT}/.venv/bin/torchrun}"
 ARTIFACT_DIR="${FOUR_SUITE_ARTIFACT_DIR:-${PROJECT_ROOT}/artifacts/task_relevant}"
-CHECKPOINT_BASE_DIR="${FOUR_SUITE_CHECKPOINT_BASE_DIR:-/workspace/vla/p3/checkpoints/libero40_joint}"
+CHECKPOINT_BASE_DIR="${FOUR_SUITE_CHECKPOINT_BASE_DIR:-${PROJECT_ROOT}/checkpoints}"
 export OPENPI_ROOT
 export PYTHONPATH="${PROJECT_ROOT}/src:${OPENPI_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -18,12 +18,15 @@ fi
 
 command="${1:-}"
 if [[ -z "${command}" ]]; then
-  echo "Usage: $0 {prepare|preflight|train|test} [arguments...]" >&2
+  echo "Usage: $0 {download-data|prepare|preflight|train|test} [arguments...]" >&2
   exit 2
 fi
 shift
 
 case "${command}" in
+  download-data)
+    exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.download_lerobot "$@"
+    ;;
   prepare)
     exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.prepare_joint_artifacts \
       --artifact-dir "${ARTIFACT_DIR}" "$@"
