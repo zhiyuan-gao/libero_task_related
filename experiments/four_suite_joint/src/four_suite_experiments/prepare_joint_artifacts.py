@@ -1,0 +1,352 @@
+"""Build small additive metadata artifacts over immutable four-suite caches."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from .constants import FOUR_SUITE_EPISODES
+from .constants import FOUR_SUITE_FRAMES
+from .constants import FOUR_SUITE_GEOMETRY_INVALID
+from .constants import FOUR_SUITE_GEOMETRY_VALID
+from .constants import FOUR_SUITE_MOTION_VALID
+from .constants import FOUR_SUITE_TASKS
+from .constants import GEOMETRY_DIM
+from .constants import LIBERO_REPO_ID
+from .constants import LIBERO_REVISION
+from .constants import MOTION_DIM
+from .constants import SUITES
+from .paths import ArtifactPaths
+from .paths import SourcePaths
+from .statistics import pool_geometry_normalizations
+from .statistics import pool_motion_normalizations
+
+
+def sha256_file(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_jsonl(path: Path) -> list[dict[str, Any]]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def _validate_manifest(frame: pd.DataFrame) -> pd.DataFrame:
+    required = {
+        "sample_id",
+        "suite",
+        "episode_id",
+        "annotation_episode_index",
+        "annotation_task_index",
+        "frame_idx",
+        "episode_length",
+        "action_sha256",
+        "semantic_subtask",
+        "geometry_valid",
+        "motion_valid",
+        "lerobot_episode_index",
+        "lerobot_task_index",
+        "lerobot_frame_index",
+        "lerobot_dataset_index",
+        "instruction",
+    }
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"joint manifest is missing columns: {missing}")
+    frame = frame.sort_values("lerobot_dataset_index").reset_index(drop=True)
+    if len(frame) != FOUR_SUITE_FRAMES or not frame["sample_id"].is_unique:
+        raise ValueError(
+            "joint manifest does not contain the frozen unique frame population"
+        )
+    if frame["lerobot_dataset_index"].astype(int).tolist() != list(
+        range(FOUR_SUITE_FRAMES)
+    ):
+        raise ValueError(
+            "joint manifest is not in exact contiguous LeRobot frame order"
+        )
+    if set(frame["suite"].astype(str)) != set(SUITES):
+        raise ValueError(
+            "joint manifest suite population differs from the frozen four suites"
+        )
+    if (
+        frame["semantic_subtask"].isna().any()
+        or frame["semantic_subtask"].astype(str).str.len().eq(0).any()
+    ):
+        raise ValueError("joint manifest has missing Semantic targets")
+    if int(frame["geometry_valid"].astype(bool).sum()) != FOUR_SUITE_GEOMETRY_VALID:
+        raise ValueError("joint manifest Geometry valid count differs")
+    if int(frame["motion_valid"].astype(bool).sum()) != FOUR_SUITE_MOTION_VALID:
+        raise ValueError("joint manifest Motion valid count differs")
+    if frame["lerobot_episode_index"].nunique() != FOUR_SUITE_EPISODES:
+        raise ValueError("joint manifest episode count differs")
+    if frame["lerobot_task_index"].nunique() != FOUR_SUITE_TASKS:
+        raise ValueError("joint manifest task count differs")
+    return frame
+
+
+def build_episode_mapping(
+    frame: pd.DataFrame, lerobot_root: Path, manifest_sha256: str
+) -> dict:
+    episode_meta = {
+        int(row["episode_index"]): row
+        for row in _read_jsonl(lerobot_root / "meta/episodes.jsonl")
+    }
+    task_meta = {
+        int(row["task_index"]): str(row["task"])
+        for row in _read_jsonl(lerobot_root / "meta/tasks.jsonl")
+    }
+    records = []
+    for raw_episode_index, raw_group in frame.groupby(
+        "lerobot_episode_index", sort=True
+    ):
+        episode_index = int(raw_episode_index)
+        group = raw_group.sort_values("lerobot_dataset_index")
+        length = len(group)
+        invariant_columns = (
+            "episode_id",
+            "annotation_episode_index",
+            "annotation_task_index",
+            "episode_length",
+            "action_sha256",
+            "lerobot_task_index",
+            "instruction",
+            "suite",
+        )
+        for column in invariant_columns:
+            if group[column].nunique(dropna=False) != 1:  # noqa: PD101
+                raise ValueError(f"episode {episode_index} has non-invariant {column}")
+        if group["lerobot_frame_index"].astype(int).tolist() != list(range(length)):
+            raise ValueError(
+                f"episode {episode_index} has non-contiguous frame indices"
+            )
+        if group["frame_idx"].astype(int).tolist() != list(range(length)):
+            raise ValueError(
+                f"episode {episode_index} annotation frames are not contiguous"
+            )
+        meta = episode_meta.get(episode_index)
+        task_index = int(group["lerobot_task_index"].iloc[0])
+        instruction = str(group["instruction"].iloc[0])
+        if (
+            meta is None
+            or int(meta["length"]) != length
+            or meta["tasks"] != [instruction]
+        ):
+            raise ValueError(
+                f"episode {episode_index} disagrees with official episode metadata"
+            )
+        if task_meta.get(task_index) != instruction:
+            raise ValueError(
+                f"episode {episode_index} disagrees with official task metadata"
+            )
+        start = int(group["lerobot_dataset_index"].iloc[0])
+        stop = int(group["lerobot_dataset_index"].iloc[-1]) + 1
+        relative_path = Path(
+            f"data/chunk-{episode_index // 1000:03d}/episode_{episode_index:06d}.parquet"
+        )
+        records.append(
+            {
+                "action_sha256": str(group["action_sha256"].iloc[0]),
+                "annotation_episode_id": str(group["episode_id"].iloc[0]),
+                "annotation_episode_index": int(
+                    group["annotation_episode_index"].iloc[0]
+                ),
+                "annotation_task_index": int(group["annotation_task_index"].iloc[0]),
+                "dataset_from_index": start,
+                "dataset_to_index_exclusive": stop,
+                "episode_length": length,
+                "instruction": instruction,
+                "lerobot_episode_index": episode_index,
+                "lerobot_task_index": task_index,
+                "parquet_relative_path": str(relative_path),
+                "suite": str(group["suite"].iloc[0]),
+            }
+        )
+    if len(records) != FOUR_SUITE_EPISODES:
+        raise ValueError("episode mapping count differs")
+    if sum(record["episode_length"] for record in records) != FOUR_SUITE_FRAMES:
+        raise ValueError("episode mapping frame count differs")
+    if [record["lerobot_episode_index"] for record in records] != list(
+        range(FOUR_SUITE_EPISODES)
+    ):
+        raise ValueError("episode mapping is not contiguous")
+    return {
+        "schema": "four_suite_lerobot_episode_mapping_v1",
+        "status": "PASS",
+        "hf_repo_id": LIBERO_REPO_ID,
+        "hf_revision": LIBERO_REVISION,
+        "mapped_episode_count": FOUR_SUITE_EPISODES,
+        "mapped_frame_count": FOUR_SUITE_FRAMES,
+        "mapped_task_count": FOUR_SUITE_TASKS,
+        "source_manifest_sha256": manifest_sha256,
+        "episodes": records,
+    }
+
+
+def _absolute_path(value: object, source_index: Path) -> object:
+    if pd.isna(value):
+        return value
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = source_index.parent / path
+    return str(path.resolve(strict=True))
+
+
+def build_geometry_index(paths: tuple[Path, Path]) -> pd.DataFrame:
+    parts = []
+    for path in paths:
+        part = pd.read_parquet(path).copy()
+        if "target_memmap_path" not in part:
+            raise ValueError(f"Geometry index lacks target_memmap_path: {path}")
+        part["target_memmap_path"] = part["target_memmap_path"].map(
+            lambda value, source=path: _absolute_path(value, source)
+        )
+        part["source_index_path"] = str(path.resolve())
+        parts.append(part)
+    frame = (
+        pd.concat(parts, ignore_index=True, sort=False)
+        .sort_values("lerobot_dataset_index")
+        .reset_index(drop=True)
+    )
+    if len(frame) != FOUR_SUITE_FRAMES or not frame["sample_id"].is_unique:
+        raise ValueError("combined Geometry index has the wrong population")
+    if frame["lerobot_dataset_index"].astype(int).tolist() != list(
+        range(FOUR_SUITE_FRAMES)
+    ):
+        raise ValueError("combined Geometry index is not in exact LeRobot order")
+    valid = frame["geometry_valid"].astype(bool)
+    if (
+        int(valid.sum()) != FOUR_SUITE_GEOMETRY_VALID
+        or int((~valid).sum()) != FOUR_SUITE_GEOMETRY_INVALID
+    ):
+        raise ValueError("combined Geometry validity counts differ")
+    if (
+        frame.loc[valid, "target_memmap_path"].isna().any()
+        or frame.loc[valid, "target_memmap_row"].isna().any()
+    ):
+        raise ValueError("valid Geometry rows lack target locations")
+    if not frame.loc[valid, "target_dim"].eq(GEOMETRY_DIM).all():
+        raise ValueError("Geometry dimensions differ")
+    if not frame.loc[valid, "target_dtype"].eq("float32").all():
+        raise ValueError("Geometry dtypes differ")
+    return frame
+
+
+def build_motion_index(paths: tuple[Path, Path]) -> pd.DataFrame:
+    parts = []
+    for path in paths:
+        part = pd.read_parquet(path).copy()
+        part["target_shard_path"] = part["target_shard_path"].map(
+            lambda value, source=path: _absolute_path(value, source)
+        )
+        part["source_index_path"] = str(path.resolve())
+        parts.append(part)
+    frame = pd.concat(parts, ignore_index=True, sort=False)
+    if len(frame) != FOUR_SUITE_MOTION_VALID or not frame["sample_id"].is_unique:
+        raise ValueError("combined Motion index has the wrong valid population")
+    if (
+        not frame["target_dim"].eq(MOTION_DIM).all()
+        or not frame["target_dtype"].eq("float32").all()
+    ):
+        raise ValueError("Motion shape/dtype differs")
+    return frame.sort_values("sample_id").reset_index(drop=True)
+
+
+def _write_json(path: Path, value: dict) -> None:
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def prepare(paths: SourcePaths, *, force: bool = False) -> ArtifactPaths:
+    for source in paths.required_sources():
+        if not source.exists():
+            raise FileNotFoundError(source)
+    output = ArtifactPaths(paths.artifact_dir)
+    output.root.mkdir(parents=True, exist_ok=True)
+    existing = [path for path in output.all_files() if path.exists()]
+    if existing and not force:
+        raise FileExistsError(
+            f"artifact files already exist; validate them or pass --force: {existing}"
+        )
+
+    manifest_sha = sha256_file(paths.joint_manifest)
+    manifest = _validate_manifest(pd.read_parquet(paths.joint_manifest))
+    mapping = build_episode_mapping(manifest, paths.lerobot_root, manifest_sha)
+    geometry = build_geometry_index(paths.geometry_indices)
+    motion = build_motion_index(paths.motion_indices)
+
+    manifest_identity = manifest[["lerobot_dataset_index", "sample_id"]]
+    if not geometry[["lerobot_dataset_index", "sample_id"]].equals(manifest_identity):
+        raise ValueError("Geometry and policy manifest frame identities differ")
+    manifest_motion_ids = set(
+        manifest.loc[manifest["motion_valid"].astype(bool), "sample_id"].astype(str)
+    )
+    if set(motion["sample_id"].astype(str)) != manifest_motion_ids:
+        raise ValueError("Motion and policy manifest valid identities differ")
+
+    geometry_normalization = pool_geometry_normalizations(paths.geometry_normalizations)
+    motion_normalization = pool_motion_normalizations(paths.motion_normalizations)
+    if geometry_normalization["sample_count"] != FOUR_SUITE_GEOMETRY_VALID:
+        raise ValueError("pooled Geometry normalization count differs")
+    if motion_normalization["count"] != FOUR_SUITE_MOTION_VALID:
+        raise ValueError("pooled Motion normalization count differs")
+
+    manifest[["lerobot_dataset_index", "sample_id", "semantic_subtask"]].to_parquet(
+        output.policy_manifest,
+        index=False,
+    )
+    _write_json(output.episode_mapping, mapping)
+    geometry.to_parquet(output.geometry_index, index=False)
+    _write_json(output.geometry_normalization, geometry_normalization)
+    motion.to_parquet(output.motion_index, index=False)
+    _write_json(output.motion_normalization, motion_normalization)
+    source_hashes = {
+        str(path.resolve()): sha256_file(path)
+        for path in (
+            paths.joint_manifest,
+            *paths.geometry_indices,
+            *paths.geometry_normalizations,
+            *paths.motion_indices,
+            *paths.motion_normalizations,
+        )
+    }
+    provenance = {
+        "schema": "four_suite_joint_artifact_provenance_v1",
+        "status": "PASS",
+        "target_scope": "task_relevant",
+        "hf_repo_id": LIBERO_REPO_ID,
+        "hf_revision": LIBERO_REVISION,
+        "episode_count": FOUR_SUITE_EPISODES,
+        "frame_count": FOUR_SUITE_FRAMES,
+        "task_count": FOUR_SUITE_TASKS,
+        "geometry_valid_count": FOUR_SUITE_GEOMETRY_VALID,
+        "motion_valid_count": FOUR_SUITE_MOTION_VALID,
+        "source_sha256": source_hashes,
+        "artifact_sha256": {
+            path.name: sha256_file(path)
+            for path in output.all_files()
+            if path != output.provenance
+        },
+    }
+    _write_json(output.provenance, provenance)
+    return output
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--artifact-dir", type=Path)
+    parser.add_argument("--force", action="store_true")
+    args = parser.parse_args()
+    paths = SourcePaths.defaults(args.artifact_dir)
+    output = prepare(paths, force=args.force)
+    print(json.dumps({"status": "PASS", "artifact_dir": str(output.root)}, indent=2))
+
+
+if __name__ == "__main__":
+    main()

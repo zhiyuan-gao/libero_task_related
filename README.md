@@ -1,5 +1,10 @@
 # openpi
 
+> This release branch's LIBERO four-suite B-Geo0.05 code and protocol live in
+> [`experiments/four_suite_joint`](experiments/four_suite_joint/README.md).
+> Generated targets, checkpoints, results, diagnostics, and prior experiment
+> reports are intentionally excluded.
+
 openpi holds open-source models and packages for robotics, published by the [Physical Intelligence team](https://www.physicalintelligence.company/).
 
 Currently, this repo contains three types of models:

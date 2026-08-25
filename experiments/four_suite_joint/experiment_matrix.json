@@ -1,0 +1,41 @@
+{
+  "schema": "four_suite_b_geo005_experiment_matrix_v1",
+  "updated_utc": "2026-08-25",
+  "population": {
+    "repo_id": "physical-intelligence/libero",
+    "revision": "a4336d589d589045d1c56423ffdf3b88a0e19b1f",
+    "episodes": 1693,
+    "frames": 273465,
+    "tasks": 40
+  },
+  "training_runs": [
+    {
+      "id": "b_geo005_main",
+      "variant": "main",
+      "supervision": ["semantic", "geometry", "motion"],
+      "action_access": ["context", "geometry", "motion"],
+      "status": "STATIC_PREFLIGHT_ONLY"
+    },
+    {
+      "id": "b_geo005_supervision_only",
+      "variant": "supervision_only",
+      "supervision": ["semantic", "geometry", "motion"],
+      "action_access": ["context"],
+      "status": "STATIC_PREFLIGHT_ONLY"
+    }
+  ],
+  "loss_coefficients": {
+    "semantic": 0.01,
+    "geometry": 0.05,
+    "motion": 0.05,
+    "ground": null
+  },
+  "excluded": [
+    "pi0.5 baseline",
+    "P1/P2/P3",
+    "Binary Ground",
+    "Geometry-conditioned Motion",
+    "whole-scene targets",
+    "previous experiment reports"
+  ]
+}

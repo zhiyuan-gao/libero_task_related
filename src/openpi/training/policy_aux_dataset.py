@@ -39,6 +39,7 @@ LIBERO3_PILOT_FRAMES = 29_250
 LIBERO3_BINARY_GROUND_POSITIVE_PATCHES = 2_094_230
 LIBERO3_BINARY_GROUND_NEGATIVE_PATCHES = 12_439_658
 LIBERO3_BINARY_GROUND_POSITIVE_WEIGHT = 5.9399674343
+LIBERO3_MOTION_VALID_FRAMES = 28_110
 
 
 @dataclasses.dataclass(frozen=True)
@@ -52,6 +53,9 @@ class PolicyAuxTrainConfig:
     geometry_normalization_path: str
     motion_target_index_path: str | None = None
     motion_normalization_path: str | None = None
+    # Freeze the valid Motion population for the selected training dataset.
+    # ``None`` preserves compatibility with the original three-task recipe.
+    motion_target_count: int | None = None
     lambda_geo: float | None = None
     lambda_sem: float | None = None
     lambda_ground: float | None = None
@@ -124,6 +128,8 @@ class PolicyAuxTrainConfig:
             self.motion_target_index_path is None or self.motion_normalization_path is None
         ):
             raise ValueError("B requires Motion target index and train normalization paths")
+        if self.motion_target_count is not None and self.motion_target_count <= 0:
+            raise ValueError("motion_target_count must be positive when set")
         if self.mode == "semantic_geometry_motion_binary_ground":
             if self.ground_objective != "binary_fixed_balanced_bce":
                 raise ValueError("P3 requires binary_fixed_balanced_bce Ground objective")
@@ -398,24 +404,31 @@ class GeometryPolicyTargetIndex:
 
 
 class MotionPolicyTargetIndex:
-    """Read the immutable three-task Motion shard cache by stable sample ID."""
+    """Read an immutable Motion shard cache by stable sample ID."""
 
-    def __init__(self, target_index_path: str | Path, normalization_path: str | Path) -> None:
+    def __init__(
+        self,
+        target_index_path: str | Path,
+        normalization_path: str | Path,
+        expected_count: int = LIBERO3_MOTION_VALID_FRAMES,
+    ) -> None:
+        if expected_count <= 0:
+            raise ValueError("Motion expected_count must be positive")
         self.target_index_path = Path(target_index_path).resolve(strict=True)
         self.normalization_path = Path(normalization_path).resolve(strict=True)
         frame = pd.read_parquet(self.target_index_path)
         required_columns = {"sample_id", "target_shard_path", "target_shard_row", "target_dim", "target_dtype"}
         if not required_columns.issubset(frame.columns):
             raise ValueError("Motion target index is missing required columns")
-        if len(frame) != 28_110 or not frame["sample_id"].is_unique:
-            raise ValueError("Motion target index must cover 28110 unique valid samples")
+        if len(frame) != expected_count or not frame["sample_id"].is_unique:
+            raise ValueError(f"Motion target index must cover {expected_count} unique valid samples")
         if not frame["target_dim"].eq(256).all() or not frame["target_dtype"].eq("float32").all():
             raise ValueError("Motion targets must all be float32[256]")
         self._rows = frame.set_index("sample_id", verify_integrity=True)
 
         normalization = json.loads(self.normalization_path.read_text())
         if (
-            int(normalization.get("count", -1)) != 28_110
+            int(normalization.get("count", -1)) != expected_count
             or normalization.get("dtype") != "float32"
             or int(normalization.get("feature_dim", -1)) != 256
             or normalization.get("finite") is not True
@@ -461,7 +474,11 @@ class PolicyAuxTargetIndex:
         self.annotations = Libero10AnnotationIndex(config.policy_manifest_path, config.episode_mapping_path)
         self.geometry = GeometryPolicyTargetIndex(config.geometry_target_index_path, config.geometry_normalization_path)
         self.motion = (
-            MotionPolicyTargetIndex(config.motion_target_index_path, config.motion_normalization_path)
+            MotionPolicyTargetIndex(
+                config.motion_target_index_path,
+                config.motion_normalization_path,
+                expected_count=config.motion_target_count or LIBERO3_MOTION_VALID_FRAMES,
+            )
             if config.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
             else None
         )
