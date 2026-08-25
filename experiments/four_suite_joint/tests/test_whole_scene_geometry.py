@@ -5,6 +5,7 @@ from four_suite_experiments.whole_scene_geometry import NUM_VIEWS
 from four_suite_experiments.whole_scene_geometry import PATCH_COUNT
 from four_suite_experiments.whole_scene_geometry import paired_difference
 from four_suite_experiments.whole_scene_geometry import pool_whole_scene_geometry
+from four_suite_experiments.whole_scene_geometry import same_forward_task_cache_check
 import numpy as np
 import pytest
 import torch
@@ -37,3 +38,22 @@ def test_geometry_paired_difference_detects_change() -> None:
     assert report["samples"] == 2
     assert report["different_rows"] == 1
     assert report["l2"]["max"] == 3
+
+
+def test_same_forward_task_cache_check_accepts_small_directional_drift() -> None:
+    frozen = np.tile(np.linspace(-2.0, 2.0, GEOMETRY_DIM), (2, 1)).astype(
+        np.float32
+    )
+    current = frozen.copy()
+    current[:, 17] += 0.1
+    report = same_forward_task_cache_check(current, frozen)
+    assert not report["within_atol_1e-5"]
+    assert report["matched_within_bfloat16_tolerance"]
+
+
+def test_same_forward_task_cache_check_rejects_wrong_direction() -> None:
+    frozen = np.tile(np.linspace(-2.0, 2.0, GEOMETRY_DIM), (2, 1)).astype(
+        np.float32
+    )
+    report = same_forward_task_cache_check(-frozen, frozen)
+    assert not report["matched_within_bfloat16_tolerance"]

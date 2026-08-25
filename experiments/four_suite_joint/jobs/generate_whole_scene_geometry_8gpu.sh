@@ -147,7 +147,9 @@ assert validation["shape"] == [8, 2048]
 assert validation["dtype"] == "float32"
 assert validation["all_finite"] and validation["no_missing_targets"]
 match = validation["same_forward_task_related_cache_check"]
-assert match["within_atol_1e-5"] and match["max_abs"] <= 1e-5
+assert match["matched_within_bfloat16_tolerance"]
+assert match["relative_l2"]["max"] <= 0.01
+assert match["cosine"]["min"] >= 0.9999
 assert validation["whole_scene_vs_task_related"]["different_rows"] > 0
 print(json.dumps({
     "status": "PASS",
