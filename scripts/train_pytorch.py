@@ -212,6 +212,7 @@ _RESUME_RUNTIME_FIELDS = {
     "keep_period",
     "log_interval",
     "max_checkpoints_to_keep",
+    "max_resume_checkpoints_to_keep",
     "num_train_steps",
     "overwrite",
     "resume",
@@ -252,6 +253,47 @@ def prune_checkpoints(
             shutil.rmtree(path)
             removed.append(step)
     return removed
+
+
+_EXACT_RESUME_FILES = ("optimizer.pt", "training_state.pt")
+
+
+def checkpoint_is_resumable(path) -> bool:
+    """Return whether a published checkpoint contains exact-continuation state."""
+
+    required = (*_EXACT_RESUME_FILES, "metadata.pt")
+    has_training_model = (path / "train_model.safetensors").is_file()
+    has_standard_model = (path / "model.safetensors").is_file()
+    return all((path / name).is_file() for name in required) and (has_training_model or has_standard_model)
+
+
+def demote_old_resume_checkpoints(checkpoint_dir, *, max_to_keep: int | None) -> list[int]:
+    """Keep exact continuation only for the newest checkpoints.
+
+    Demotion happens only after a new checkpoint has been atomically published.
+    Evaluation weights, assets, and metadata remain in every checkpoint.
+    """
+
+    if max_to_keep is None:
+        return []
+    resumable = sorted(
+        (int(path.name), path)
+        for path in checkpoint_dir.iterdir()
+        if path.is_dir() and path.name.isdigit() and checkpoint_is_resumable(path)
+    )
+    demoted = []
+    for step, path in resumable[:-max_to_keep]:
+        if not (path / "model.safetensors").is_file():
+            raise FileNotFoundError(f"Refusing to demote checkpoint without evaluation weights: {path}")
+        for name in (*_EXACT_RESUME_FILES, "train_model.safetensors"):
+            payload = path / name
+            if payload.exists():
+                payload.unlink()
+        (path / "EVALUATION_ONLY").write_text(
+            "Exact-continuation state was pruned; model.safetensors remains valid for evaluation.\n"
+        )
+        demoted.append(step)
+    return demoted
 
 
 def save_checkpoint(
@@ -359,6 +401,13 @@ def save_checkpoint(
     if removed:
         logging.info(f"Pruned superseded ordinary checkpoints: {removed}")
 
+    demoted = demote_old_resume_checkpoints(
+        config.checkpoint_dir,
+        max_to_keep=config.max_resume_checkpoints_to_keep,
+    )
+    if demoted:
+        logging.info(f"Demoted old checkpoints to evaluation-only: {demoted}")
+
     logging.info(f"Saved checkpoint at step {global_step} -> {final_ckpt_dir}")
 
     # Log checkpoint to wandb
@@ -369,13 +418,11 @@ def save_checkpoint(
 def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, config, ema):
     """Load the latest checkpoint and restore exact per-rank continuation state."""
     checkpoint_steps = [
-        int(d.name)
-        for d in checkpoint_dir.iterdir()
-        if d.is_dir() and d.name.isdigit() and not d.name.startswith("tmp_")
+        int(d.name) for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.isdigit() and checkpoint_is_resumable(d)
     ]
 
     if not checkpoint_steps:
-        raise FileNotFoundError(f"No checkpoints found in {checkpoint_dir}")
+        raise FileNotFoundError(f"No resumable checkpoints found in {checkpoint_dir}")
 
     latest_step = max(checkpoint_steps)
     ckpt_dir = checkpoint_dir / f"{latest_step}"
@@ -514,12 +561,12 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device, data_loader, confi
         raise
 
 
-def get_latest_checkpoint_step(checkpoint_dir):
+def get_latest_checkpoint_step(checkpoint_dir, *, resumable_only: bool = False):
     """Get the latest checkpoint step number from a checkpoint directory."""
     checkpoint_steps = [
         int(d.name)
         for d in checkpoint_dir.iterdir()
-        if d.is_dir() and d.name.isdigit() and not d.name.startswith("tmp_")
+        if d.is_dir() and d.name.isdigit() and (not resumable_only or checkpoint_is_resumable(d))
     ]
     return max(checkpoint_steps) if checkpoint_steps else None
 
@@ -572,13 +619,19 @@ def train_loop(config: _config.TrainConfig):
     set_seed(config.seed, rank)
 
     # Initialize checkpoint directory and wandb
+    # Every rank must snapshot the pre-launch state before rank 0 can create the
+    # directory. Otherwise slower ranks can mistake rank 0's new directory for
+    # a pre-existing experiment and abort a clean DDP launch.
+    checkpoint_dir_existed_at_launch = config.checkpoint_dir.exists()
+    if use_ddp:
+        dist.barrier()
     resuming = False
     if config.resume:
         # Find checkpoint directory based on experiment name
         exp_checkpoint_dir = config.checkpoint_dir
-        if exp_checkpoint_dir.exists():
+        if checkpoint_dir_existed_at_launch:
             # Use validation to find the latest working checkpoint
-            latest_step = get_latest_checkpoint_step(exp_checkpoint_dir)
+            latest_step = get_latest_checkpoint_step(exp_checkpoint_dir, resumable_only=True)
             if latest_step is not None:
                 resuming = True
                 logging.info(
@@ -589,12 +642,12 @@ def train_loop(config: _config.TrainConfig):
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
     elif config.overwrite:
-        if is_main and config.checkpoint_dir.exists():
+        if is_main and checkpoint_dir_existed_at_launch:
             shutil.rmtree(config.checkpoint_dir)
             logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
         if use_ddp:
             dist.barrier()
-    elif config.checkpoint_dir.exists():
+    elif checkpoint_dir_existed_at_launch:
         raise FileExistsError(
             f"Checkpoint directory {config.checkpoint_dir} already exists. Use --overwrite or --resume."
         )

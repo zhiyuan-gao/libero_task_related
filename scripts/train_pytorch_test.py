@@ -55,6 +55,7 @@ def test_trajectory_config_ignores_runtime_controls_but_not_recipe(tmp_path) -> 
         keep_period=None,
         checkpoint_keep_steps=(1, 4),
         max_checkpoints_to_keep=8,
+        max_resume_checkpoints_to_keep=2,
         log_interval=1,
         resume=True,
         wandb_enabled=True,
@@ -108,6 +109,78 @@ def test_prune_checkpoints_can_keep_last_eight_for_libero10(tmp_path) -> None:
         11_000,
         11_132,
     }
+
+
+def test_demote_old_resume_checkpoints_preserves_evaluation_weights(tmp_path) -> None:
+    steps = tuple(range(1000, 30_001, 1000))
+    for step in steps:
+        checkpoint = tmp_path / str(step)
+        checkpoint.mkdir()
+        for name in (
+            "model.safetensors",
+            "train_model.safetensors",
+            "optimizer.pt",
+            "training_state.pt",
+            "metadata.pt",
+        ):
+            (checkpoint / name).write_bytes(b"test")
+
+    demoted = train_pytorch.demote_old_resume_checkpoints(tmp_path, max_to_keep=2)
+
+    assert demoted == list(steps[:-2])
+    assert all((tmp_path / str(step) / "model.safetensors").is_file() for step in steps)
+    old = tmp_path / "1000"
+    assert (old / "model.safetensors").is_file()
+    assert (old / "metadata.pt").is_file()
+    assert (old / "EVALUATION_ONLY").is_file()
+    assert not (old / "train_model.safetensors").exists()
+    assert not (old / "optimizer.pt").exists()
+    assert not (old / "training_state.pt").exists()
+    assert not train_pytorch.checkpoint_is_resumable(old)
+    assert not any(train_pytorch.checkpoint_is_resumable(tmp_path / str(step)) for step in steps[:-2])
+    assert train_pytorch.checkpoint_is_resumable(tmp_path / "29000")
+    assert train_pytorch.checkpoint_is_resumable(tmp_path / "30000")
+
+
+def test_save_checkpoint_keeps_all_models_and_latest_two_resume_states(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(train_pytorch, "log_memory_usage", lambda *args, **kwargs: None)
+    model = torch.nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    config = _config_for_checkpoint(
+        tmp_path,
+        ema_decay=None,
+        num_train_steps=3,
+        save_interval=1,
+        keep_period=1,
+        max_checkpoints_to_keep=None,
+        max_resume_checkpoints_to_keep=2,
+    )
+    for step in (1, 2, 3):
+        train_pytorch.save_checkpoint(
+            model,
+            optimizer,
+            step,
+            config,
+            is_main=True,
+            data_config=SimpleNamespace(norm_stats=None, asset_id=None),
+            data_loader=_ResumeLoader(step),
+            ema=None,
+            micro_step_in_update=0,
+        )
+
+    assert {path.name for path in config.checkpoint_dir.iterdir()} == {"1", "2", "3"}
+    assert all((config.checkpoint_dir / str(step) / "model.safetensors").is_file() for step in (1, 2, 3))
+    assert not train_pytorch.checkpoint_is_resumable(config.checkpoint_dir / "1")
+    assert train_pytorch.checkpoint_is_resumable(config.checkpoint_dir / "2")
+    assert train_pytorch.checkpoint_is_resumable(config.checkpoint_dir / "3")
+    assert train_pytorch.get_latest_checkpoint_step(config.checkpoint_dir) == 3
+    assert train_pytorch.get_latest_checkpoint_step(config.checkpoint_dir, resumable_only=True) == 3
+
+    evaluation_only = config.checkpoint_dir / "4"
+    evaluation_only.mkdir()
+    (evaluation_only / "model.safetensors").write_bytes(b"test")
+    assert train_pytorch.get_latest_checkpoint_step(config.checkpoint_dir) == 4
+    assert train_pytorch.get_latest_checkpoint_step(config.checkpoint_dir, resumable_only=True) == 3
 
 
 def test_checkpoint_roundtrip_restores_raw_ema_and_allows_runtime_changes(tmp_path, monkeypatch) -> None:

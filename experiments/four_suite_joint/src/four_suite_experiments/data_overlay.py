@@ -22,6 +22,8 @@ from .constants import LIBERO_REPO_ID
 from .constants import LIBERO_REVISION
 from .constants import MOTION_DIM
 
+_UpstreamPolicyAuxTransformedDataset = upstream.PolicyAuxTransformedDataset
+
 
 @dataclasses.dataclass(frozen=True)
 class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
@@ -286,18 +288,26 @@ class FourSuitePolicyAuxTargetIndex:
         return result
 
 
-def install_data_overlay() -> None:
-    """Redirect the existing transformed dataset's late-bound target class."""
+class FourSuitePolicyAuxTransformedDataset(_UpstreamPolicyAuxTransformedDataset):
+    """Spawn-safe dataset overlay for the portable four-suite target manifest."""
 
-    current = upstream.PolicyAuxTargetIndex
-    if current is FourSuitePolicyAuxTargetIndex:
-        return
-    if getattr(current, "__four_suite_overlay__", False):
-        return
+    def _make_target_index(self) -> FourSuitePolicyAuxTargetIndex:
+        return FourSuitePolicyAuxTargetIndex(self.config)
+
+
+def install_data_overlay() -> None:
+    """Install target and dataset classes used by the four-suite entry point.
+
+    The dataset subclass is intentional: unlike a module monkeypatch, its class
+    identity survives serialization into PyTorch DataLoader spawn workers.
+    """
+
     FourSuitePolicyAuxTargetIndex.__four_suite_overlay__ = True
+    FourSuitePolicyAuxTransformedDataset.__four_suite_overlay__ = True
     upstream.PolicyAuxTargetIndex = FourSuitePolicyAuxTargetIndex
+    upstream.PolicyAuxTransformedDataset = FourSuitePolicyAuxTransformedDataset
 
 
 @functools.lru_cache(maxsize=1)
 def overlay_identity() -> str:
-    return "four_suite_policy_aux_overlay_v1"
+    return "four_suite_policy_aux_overlay_v2_spawn_safe"

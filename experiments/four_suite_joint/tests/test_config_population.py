@@ -10,7 +10,11 @@ from four_suite_experiments.configs import expected_target_scope
 from four_suite_experiments.constants import FOUR_SUITE_EPISODES
 from four_suite_experiments.constants import FOUR_SUITE_FRAMES
 from four_suite_experiments.data_overlay import FourSuitePolicyAuxTrainConfig
+from four_suite_experiments.data_overlay import FourSuitePolicyAuxTransformedDataset
+from four_suite_experiments.data_overlay import install_data_overlay
 from four_suite_experiments.paths import ArtifactPaths
+
+from openpi.training import policy_aux_dataset as upstream_policy_aux_dataset
 
 
 def test_four_suite_mapping_population(tmp_path) -> None:
@@ -62,6 +66,26 @@ def test_four_suite_mapping_population(tmp_path) -> None:
     assert config.lerobot_dataset_indices() == list(range(FOUR_SUITE_FRAMES))
 
 
+def test_four_suite_dataset_overlay_is_spawn_safe(monkeypatch) -> None:
+    sentinel = object()
+    config = object()
+    dataset = FourSuitePolicyAuxTransformedDataset.__new__(
+        FourSuitePolicyAuxTransformedDataset
+    )
+    dataset.config = config
+    monkeypatch.setattr(
+        "four_suite_experiments.data_overlay.FourSuitePolicyAuxTargetIndex",
+        lambda received: sentinel if received is config else None,
+    )
+    assert dataset._make_target_index() is sentinel  # noqa: SLF001
+
+    install_data_overlay()
+    assert (
+        upstream_policy_aux_dataset.PolicyAuxTransformedDataset
+        is FourSuitePolicyAuxTransformedDataset
+    )
+
+
 def test_trqc_and_no_query_access_configs_differ_only_by_identity(tmp_path) -> None:
     common = {
         "artifacts": ArtifactPaths(tmp_path / "artifacts"),
@@ -98,6 +122,10 @@ def test_trqc_and_no_query_access_configs_differ_only_by_identity(tmp_path) -> N
     assert main.policy_aux.motion_target_count == 256_401
     assert main.policy_aux.target_scope == "task_relevant"
     assert Path(main.pytorch_weight_path).name == "pi05_base_pytorch_fp32"
+    assert main.save_interval == 1_000
+    assert main.keep_period == 1_000
+    assert main.max_checkpoints_to_keep is None
+    assert main.max_resume_checkpoints_to_keep == 2
 
 
 def test_whole_scene_variant_changes_only_scope_and_artifact_paths(tmp_path) -> None:

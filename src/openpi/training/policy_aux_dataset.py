@@ -561,12 +561,21 @@ class PolicyAuxTransformedDataset:
     def __len__(self) -> int:
         return len(self.dataset)
 
+    def _make_target_index(self) -> PolicyAuxTargetIndex:
+        """Build the target index inside the current DataLoader process.
+
+        Dataset overlays can override this method without relying on process-local
+        monkeypatches, which are not inherited by DataLoader ``spawn`` workers.
+        """
+
+        return PolicyAuxTargetIndex(self.config)
+
     def __getitem__(self, index: int) -> dict:
         if self._target_index is None:
             # Construct lazily inside each spawned DataLoader worker. The large
             # target matrix remains a shared read-only OS memory map rather than
             # being serialized from the parent process.
-            self._target_index = PolicyAuxTargetIndex(self.config)
+            self._target_index = self._make_target_index()
         item = self.dataset[index]
         if "policy_aux" in item:
             raise ValueError("Base transformed dataset unexpectedly contains policy_aux")

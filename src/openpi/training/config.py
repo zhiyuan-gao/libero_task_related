@@ -537,6 +537,10 @@ class TrainConfig:
     # Optional rolling retention cap for ordinary scheduled/final checkpoints.
     # Exact milestones and keep_period checkpoints remain protected.
     max_checkpoints_to_keep: int | None = None
+    # Optional rolling retention cap for exact-continuation payloads. Older
+    # checkpoints remain evaluable, but their optimizer, RNG/DataLoader, and
+    # (when EMA is enabled) raw training-weight files are removed.
+    max_resume_checkpoints_to_keep: int | None = None
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -581,6 +585,8 @@ class TrainConfig:
             raise ValueError("checkpoint_keep_steps must contain unique positive optimizer steps")
         if self.max_checkpoints_to_keep is not None and self.max_checkpoints_to_keep <= 0:
             raise ValueError("max_checkpoints_to_keep must be positive when set")
+        if self.max_resume_checkpoints_to_keep is not None and self.max_resume_checkpoints_to_keep <= 0:
+            raise ValueError("max_resume_checkpoints_to_keep must be positive when set")
         frozen_policy_aux = {
             "pi05_libero_p1_aux": {
                 "mode": "geometry",
