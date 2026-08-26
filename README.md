@@ -98,24 +98,28 @@ uvx --from 'huggingface_hub>=1.0' hf auth login
 uvx --from 'huggingface_hub>=1.0' hf download \
   Zhiyuan17/libero40-trqc-assets \
   --repo-type dataset \
-  --revision task-relevant-v1 \
+  --revision task-and-whole-scene-v1 \
   --local-dir "$LIBERO40_ROOT/assets"
 
 cd "$LIBERO40_ROOT/assets"
 sha256sum -c SHA256SUMS
 ```
 
-`task-relevant-v1` resolves to asset commit
-`45393408a29bb9cb04e03855494ea00d7d2bc9be`. It contains:
+`task-and-whole-scene-v1` resolves to asset commit
+`cb1c086c7928556af7c2d08ee99f226102c67692`. It contains:
 
 - the strict FP32-converted pi0.5 PyTorch base;
 - official LIBERO policy normalization statistics;
 - the frozen sample-identity and Semantic manifest;
 - task-relevant Geometry targets for 273,377 valid frames;
-- task-relevant Motion targets for 256,401 valid frames.
+- task-relevant Motion targets for 256,401 valid frames;
+- Whole-scene Geometry targets for the same 273,377 valid frames;
+- Whole-scene Motion targets for the same 256,401 valid frames.
 
-The 16.96 GB asset release does not duplicate the public LeRobot data and does
-not contain checkpoints, reports, worker logs, or Whole-scene targets.
+The 19.45 GB asset release does not duplicate the public LeRobot data and does
+not contain checkpoints, reports, worker logs, smoke outputs, or temporary
+generation shards. The earlier `task-relevant-v1` tag remains frozen for exact
+reproduction of the two task-relevant variants alone.
 
 ## 3. Configure local paths
 
@@ -133,6 +137,8 @@ FOUR_SUITE_ANNOTATION_ROOT=$LIBERO40_ROOT/assets/annotation
 FOUR_SUITE_JOINT_MANIFEST=$LIBERO40_ROOT/assets/runtime_metadata/four_suite_policy_geometry_manifest.parquet
 FOUR_SUITE_BASE_WEIGHTS=$LIBERO40_ROOT/assets/models/pi05_base_pytorch_fp32
 FOUR_SUITE_LIBERO_ASSETS=$LIBERO40_ROOT/assets/models/pi05_libero_pytorch/assets
+FOUR_SUITE_WHOLE_SCENE_GEOMETRY_ROOT=$LIBERO40_ROOT/assets/annotation/policy_aux_v1/geometry_whole_scene_four_suite_v1
+FOUR_SUITE_WHOLE_SCENE_MOTION_ROOT=$LIBERO40_ROOT/assets/annotation/policy_aux_v1/motion_whole_scene_four_suite_v1
 ```
 
 Keep `hpc.env` untracked. All preparation and training jobs must receive its
@@ -153,9 +159,12 @@ source hpc.env
   --variant trqc --num-train-steps 30000 --warmup-steps 10000
 ./jobs/run_8gpu.sh preflight \
   --variant no_query_access --num-train-steps 30000 --warmup-steps 10000
+./jobs/run_8gpu.sh prepare --target-scope whole_scene
+./jobs/run_8gpu.sh preflight \
+  --variant whole_scene --num-train-steps 30000 --warmup-steps 10000
 ```
 
-Both preflights are read-only and report `optimizer_steps_executed: 0`. Then
+All three preflights are read-only and report `optimizer_steps_executed: 0`. Then
 verify the actual Slurm node, environment, and eight-GPU visibility:
 
 ```bash
@@ -185,38 +194,18 @@ sbatch --account=ACCOUNT --partition=PARTITION --time=TIME --mem=MEMORY \
     --disable-wandb
 ```
 
-Run the query-access ablation by changing only these arguments:
+Run the two ablations by changing only these arguments:
 
 ```text
 --variant no_query_access --exp-name libero40_no_query_access_seed42
+--variant whole_scene --exp-name libero40_whole_scene_seed42
 ```
 
 Do not add `--overwrite` to an existing experiment. Use `--resume` only when
 resuming the same configuration and checkpoint directory.
 
-## Whole-scene ablation status
-
-The code path and cache generators for `whole_scene` are included, but the
-frozen `task-relevant-v1` asset tag does not contain Whole-scene Geometry or
-Motion. The preparation gate will fail if those assets are absent; it never
-falls back to task-relevant targets.
-
-After a separately validated Whole-scene asset release is published, download
-that pinned tag, point `FOUR_SUITE_WHOLE_SCENE_GEOMETRY_ROOT` and
-`FOUR_SUITE_WHOLE_SCENE_MOTION_ROOT` at its cache directories, and run:
-
-```bash
-source hpc.env
-./jobs/run_8gpu.sh prepare --target-scope whole_scene
-./jobs/run_8gpu.sh preflight \
-  --variant whole_scene --num-train-steps 30000 --warmup-steps 10000
-```
-
-Only after that preflight passes should the formal command use:
-
-```text
---variant whole_scene --exp-name libero40_whole_scene_seed42
-```
+The Whole-scene source loader requires the explicit Whole-scene cache roots
+and target-scope provenance. It never falls back to task-relevant targets.
 
 The only authoritative instructions for this release branch are this README
 and the checked-in `experiments/four_suite_joint/hpc.env.example` template.
