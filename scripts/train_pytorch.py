@@ -202,7 +202,10 @@ def reduce_scalar_metrics(values: dict[str, float], device: torch.device) -> dic
 
 
 def should_save_checkpoint(global_step: int, config: _config.TrainConfig) -> bool:
-    return (global_step % config.save_interval == 0 and global_step > 0) or (
+    interval = config.save_interval
+    if config.late_save_start_step is not None and global_step > config.late_save_start_step:
+        interval = config.late_save_interval
+    return (global_step % interval == 0 and global_step > 0) or (
         config.save_final_checkpoint and global_step == config.num_train_steps
     )
 
@@ -210,6 +213,8 @@ def should_save_checkpoint(global_step: int, config: _config.TrainConfig) -> boo
 _RESUME_RUNTIME_FIELDS = {
     "checkpoint_keep_steps",
     "keep_period",
+    "late_save_interval",
+    "late_save_start_step",
     "log_interval",
     "max_checkpoints_to_keep",
     "max_resume_checkpoints_to_keep",

@@ -29,11 +29,12 @@ its targets and losses are identical to `trqc`.
 
 The candidate formal recipe is 30,000 optimizer updates, 10,000 warmup
 updates, global batch 256, seed 42, BF16, AdamW, gradient clipping at 1.0, and
-no EMA. Training saves every 1,000 updates and retains all 30 evaluation models
-from step 1,000 through 30,000. Only the newest two checkpoints retain AdamW,
-RNG, sampler, and DataLoader state for exact continuation; older checkpoints
-are demoted to evaluation-only after each new checkpoint is atomically
-published. Formal training is gated and is never started by installation,
+no EMA. Training saves every 1,000 updates through step 20,000, then every 500
+updates through step 30,000. A rolling cap retains 30 evaluation models, so the
+final set is `11k..20k` at 1k intervals plus `20.5k..30k` at 500-step intervals.
+Only the newest two checkpoints retain AdamW, RNG, sampler, and DataLoader state
+for exact continuation; older retained checkpoints are evaluation-only. Formal
+training is gated and is never started by installation,
 download, preparation, testing, or preflight commands.
 
 ## Required HPC environment

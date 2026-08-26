@@ -51,6 +51,8 @@ def test_trajectory_config_ignores_runtime_controls_but_not_recipe(tmp_path) -> 
         base,
         num_train_steps=4,
         save_interval=1000,
+        late_save_interval=500,
+        late_save_start_step=2,
         save_final_checkpoint=False,
         keep_period=None,
         checkpoint_keep_steps=(1, 4),
@@ -64,6 +66,33 @@ def test_trajectory_config_ignores_runtime_controls_but_not_recipe(tmp_path) -> 
 
     assert train_pytorch.trajectory_config(runtime_change) == train_pytorch.trajectory_config(base)
     assert train_pytorch.trajectory_config(recipe_change) != train_pytorch.trajectory_config(base)
+
+
+def test_four_suite_late_dense_schedule_retains_final_thirty(tmp_path) -> None:
+    config = _config_for_checkpoint(
+        tmp_path,
+        num_train_steps=30_000,
+        save_interval=1_000,
+        late_save_interval=500,
+        late_save_start_step=20_000,
+        keep_period=None,
+        max_checkpoints_to_keep=30,
+    )
+    scheduled = [step for step in range(1, 30_001) if train_pytorch.should_save_checkpoint(step, config)]
+    expected_generated = [*range(1_000, 20_001, 1_000), *range(20_500, 30_001, 500)]
+    assert scheduled == expected_generated
+
+    for step in scheduled:
+        (config.checkpoint_dir / str(step)).mkdir()
+    removed = train_pytorch.prune_checkpoints(
+        config.checkpoint_dir,
+        keep_period=config.keep_period,
+        keep_steps=config.checkpoint_keep_steps,
+        max_to_keep=config.max_checkpoints_to_keep,
+    )
+    expected_retained = [*range(11_000, 20_001, 1_000), *range(20_500, 30_001, 500)]
+    assert removed == list(range(1_000, 10_001, 1_000))
+    assert sorted(int(path.name) for path in config.checkpoint_dir.iterdir()) == expected_retained
 
 
 def test_prune_checkpoints_preserves_periodic_and_latest(tmp_path) -> None:

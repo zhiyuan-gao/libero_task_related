@@ -528,6 +528,11 @@ class TrainConfig:
     log_interval: int = 100
     # How often (in steps) to save checkpoints.
     save_interval: int = 1000
+    # Optional denser checkpoint cadence after a fixed optimizer step. The
+    # regular cadence applies through ``late_save_start_step``; the late cadence
+    # applies strictly after it.
+    late_save_interval: int | None = None
+    late_save_start_step: int | None = None
     # Save at the final optimizer update even when it is off the regular cadence.
     save_final_checkpoint: bool = True
     # If set, any existing checkpoints matching step % keep_period == 0 will not be deleted.
@@ -579,6 +584,12 @@ class TrainConfig:
     def __post_init__(self) -> None:
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
+        if (self.late_save_interval is None) != (self.late_save_start_step is None):
+            raise ValueError("late_save_interval and late_save_start_step must be set together")
+        if self.late_save_interval is not None and self.late_save_interval <= 0:
+            raise ValueError("late_save_interval must be positive when set")
+        if self.late_save_start_step is not None and self.late_save_start_step <= 0:
+            raise ValueError("late_save_start_step must be positive when set")
         if any(step <= 0 for step in self.checkpoint_keep_steps) or len(set(self.checkpoint_keep_steps)) != len(
             self.checkpoint_keep_steps
         ):

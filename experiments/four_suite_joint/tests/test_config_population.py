@@ -123,8 +123,10 @@ def test_trqc_and_no_query_access_configs_differ_only_by_identity(tmp_path) -> N
     assert main.policy_aux.target_scope == "task_relevant"
     assert Path(main.pytorch_weight_path).name == "pi05_base_pytorch_fp32"
     assert main.save_interval == 1_000
-    assert main.keep_period == 1_000
-    assert main.max_checkpoints_to_keep is None
+    assert main.late_save_interval == 500
+    assert main.late_save_start_step == 20_000
+    assert main.keep_period is None
+    assert main.max_checkpoints_to_keep == 30
     assert main.max_resume_checkpoints_to_keep == 2
 
 
