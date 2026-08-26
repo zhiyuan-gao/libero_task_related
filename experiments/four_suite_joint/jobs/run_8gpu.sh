@@ -9,6 +9,14 @@ FOUR_SUITE_TORCHRUN="${FOUR_SUITE_TORCHRUN:-${OPENPI_ROOT}/.venv/bin/torchrun}"
 CHECKPOINT_BASE_DIR="${FOUR_SUITE_CHECKPOINT_BASE_DIR:-${PROJECT_ROOT}/checkpoints}"
 export OPENPI_ROOT
 export PYTHONPATH="${PROJECT_ROOT}/src:${OPENPI_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
+# Match the validated LIBERO-10 B performance environment. The trainer would
+# otherwise enable expandable CUDA segments automatically for an 8-GPU job;
+# this fixed-shape workload is materially faster with PyTorch's default native
+# caching allocator. Per-update allocator statistics are diagnostic-only and
+# add synchronization, so keep them off for smoke and formal training.
+export OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=1
+export OPENPI_LOG_MEMORY_STATS=0
+export TOKENIZERS_PARALLELISM=false
 
 if [[ ! -x "${FOUR_SUITE_PYTHON}" ]]; then
   echo "Python environment is unavailable: ${FOUR_SUITE_PYTHON}" >&2

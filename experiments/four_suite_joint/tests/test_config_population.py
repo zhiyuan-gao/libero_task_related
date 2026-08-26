@@ -69,9 +69,7 @@ def test_four_suite_mapping_population(tmp_path) -> None:
 def test_four_suite_dataset_overlay_is_spawn_safe(monkeypatch) -> None:
     sentinel = object()
     config = object()
-    dataset = FourSuitePolicyAuxTransformedDataset.__new__(
-        FourSuitePolicyAuxTransformedDataset
-    )
+    dataset = FourSuitePolicyAuxTransformedDataset.__new__(FourSuitePolicyAuxTransformedDataset)
     dataset.config = config
     monkeypatch.setattr(
         "four_suite_experiments.data_overlay.FourSuitePolicyAuxTargetIndex",
@@ -80,10 +78,7 @@ def test_four_suite_dataset_overlay_is_spawn_safe(monkeypatch) -> None:
     assert dataset._make_target_index() is sentinel  # noqa: SLF001
 
     install_data_overlay()
-    assert (
-        upstream_policy_aux_dataset.PolicyAuxTransformedDataset
-        is FourSuitePolicyAuxTransformedDataset
-    )
+    assert upstream_policy_aux_dataset.PolicyAuxTransformedDataset is FourSuitePolicyAuxTransformedDataset
 
 
 def test_trqc_and_no_query_access_configs_differ_only_by_identity(tmp_path) -> None:
@@ -98,9 +93,7 @@ def test_trqc_and_no_query_access_configs_differ_only_by_identity(tmp_path) -> N
         "wandb_enabled": False,
     }
     main = build_train_config(variant="trqc", exp_name="trqc", **common)
-    control = build_train_config(
-        variant="no_query_access", exp_name="no_query_access", **common
-    )
+    control = build_train_config(variant="no_query_access", exp_name="no_query_access", **common)
     differing = []
     for field in dataclasses.fields(main):
         left = getattr(main, field.name)
@@ -158,19 +151,15 @@ def test_whole_scene_variant_changes_only_scope_and_artifact_paths(tmp_path) -> 
     assert task.policy_aux.lambda_sem == whole.policy_aux.lambda_sem == 0.01
     assert task.policy_aux.lambda_geo == whole.policy_aux.lambda_geo == 0.05
     assert task.policy_aux.lambda_motion == whole.policy_aux.lambda_motion == 0.05
-    assert (
-        task.policy_aux.num_geometry_queries
-        == whole.policy_aux.num_geometry_queries
-        == 8
-    )
-    assert (
-        task.policy_aux.num_motion_queries == whole.policy_aux.num_motion_queries == 8
-    )
-    assert (
-        task.policy_aux.geometry_target_index_path
-        != whole.policy_aux.geometry_target_index_path
-    )
-    assert (
-        task.policy_aux.motion_target_index_path
-        != whole.policy_aux.motion_target_index_path
-    )
+    assert task.policy_aux.num_geometry_queries == whole.policy_aux.num_geometry_queries == 8
+    assert task.policy_aux.num_motion_queries == whole.policy_aux.num_motion_queries == 8
+    assert task.policy_aux.geometry_target_index_path != whole.policy_aux.geometry_target_index_path
+    assert task.policy_aux.motion_target_index_path != whole.policy_aux.motion_target_index_path
+
+
+def test_8gpu_launcher_uses_validated_allocator_settings() -> None:
+    launcher = Path(__file__).resolve().parents[1] / "jobs/run_8gpu.sh"
+    text = launcher.read_text()
+    assert "export OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=1" in text
+    assert "export OPENPI_LOG_MEMORY_STATS=0" in text
+    assert "export TOKENIZERS_PARALLELISM=false" in text

@@ -150,9 +150,11 @@ absolute path through `FOUR_SUITE_HPC_ENV_FILE`.
 
 ## 4. Prepare and preflight
 
-Preparation rebuilds small portable indices on the HPC filesystem and rewrites
-legacy cache paths. Do not copy a prepared artifact directory from another
-machine.
+Preparation rebuilds portable indices on the HPC filesystem, rewrites legacy
+cache paths, and materializes each scope's compressed Motion shards as one
+read-only FP32 `.npy` memmap (about 250 MiB). Training workers share the operating
+system page cache instead of repeatedly decompressing private NPZ shard caches.
+Do not copy a prepared artifact directory from another machine.
 
 ```bash
 cd "$LIBERO40_ROOT/libero_task_related/experiments/four_suite_joint"

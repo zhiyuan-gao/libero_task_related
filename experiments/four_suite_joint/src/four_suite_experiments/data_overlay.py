@@ -37,19 +37,12 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
         super().__post_init__()
         if self.lerobot_task_indices is not None:
             raise ValueError("four-suite training requires all 40 tasks")
-        if (
-            self.expected_episodes != FOUR_SUITE_EPISODES
-            or self.expected_frames != FOUR_SUITE_FRAMES
-        ):
+        if self.expected_episodes != FOUR_SUITE_EPISODES or self.expected_frames != FOUR_SUITE_FRAMES:
             raise ValueError("four-suite population counts are frozen")
         if self.motion_target_count != FOUR_SUITE_MOTION_VALID:
-            raise ValueError(
-                f"four-suite Motion count must be {FOUR_SUITE_MOTION_VALID}"
-            )
+            raise ValueError(f"four-suite Motion count must be {FOUR_SUITE_MOTION_VALID}")
         if self.target_scope not in ("task_relevant", "whole_scene"):
-            raise ValueError(
-                f"unsupported four-suite target scope: {self.target_scope}"
-            )
+            raise ValueError(f"unsupported four-suite target scope: {self.target_scope}")
 
     def _validated_mapping_records(self) -> list[dict]:
         mapping = json.loads(Path(self.episode_mapping_path).read_text())
@@ -63,21 +56,14 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
             or len(records) != FOUR_SUITE_EPISODES
             or sum(int(row["episode_length"]) for row in records) != FOUR_SUITE_FRAMES
         ):
-            raise ValueError(
-                "four-suite episode mapping is not the frozen official population"
-            )
+            raise ValueError("four-suite episode mapping is not the frozen official population")
         records = sorted(records, key=lambda row: int(row["lerobot_episode_index"]))
-        if [int(row["lerobot_episode_index"]) for row in records] != list(
-            range(FOUR_SUITE_EPISODES)
-        ):
+        if [int(row["lerobot_episode_index"]) for row in records] != list(range(FOUR_SUITE_EPISODES)):
             raise ValueError("four-suite episode mapping is not contiguous")
         return records
 
     def lerobot_episode_indices(self) -> list[int]:
-        return [
-            int(row["lerobot_episode_index"])
-            for row in self._validated_mapping_records()
-        ]
+        return [int(row["lerobot_episode_index"]) for row in self._validated_mapping_records()]
 
     def lerobot_dataset_indices(self) -> list[int]:
         indices: list[int] = []
@@ -88,9 +74,7 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
                 raise ValueError(f"invalid dataset range in episode mapping: {row}")
             indices.extend(range(start, stop))
         if indices != list(range(FOUR_SUITE_FRAMES)):
-            raise ValueError(
-                "four-suite dataset frame identities are not exactly contiguous"
-            )
+            raise ValueError("four-suite dataset frame identities are not exactly contiguous")
         return indices
 
 
@@ -104,19 +88,11 @@ class FourSuiteAnnotationIndex:
             columns=["lerobot_dataset_index", "sample_id", "semantic_subtask"],
         ).sort_values("lerobot_dataset_index")
         if len(frame) != FOUR_SUITE_FRAMES or not frame["sample_id"].is_unique:
-            raise ValueError(
-                "four-suite annotation manifest has the wrong frame population"
-            )
-        if frame["lerobot_dataset_index"].astype(int).tolist() != list(
-            range(FOUR_SUITE_FRAMES)
-        ):
-            raise ValueError(
-                "four-suite annotation manifest is not in exact LeRobot order"
-            )
+            raise ValueError("four-suite annotation manifest has the wrong frame population")
+        if frame["lerobot_dataset_index"].astype(int).tolist() != list(range(FOUR_SUITE_FRAMES)):
+            raise ValueError("four-suite annotation manifest is not in exact LeRobot order")
         if frame["semantic_subtask"].isna().any():
-            raise ValueError(
-                "four-suite annotation manifest has missing Semantic targets"
-            )
+            raise ValueError("four-suite annotation manifest has missing Semantic targets")
         self._frame = frame.reset_index(drop=True)
 
     def row_by_dataset_index(self, dataset_index: int) -> pd.Series:
@@ -131,9 +107,7 @@ class FourSuiteAnnotationIndex:
 class FourSuiteGeometryTargetIndex:
     """Read multiple immutable Geometry memmaps through one ordered index."""
 
-    def __init__(
-        self, target_index_path: str | Path, normalization_path: str | Path
-    ) -> None:
+    def __init__(self, target_index_path: str | Path, normalization_path: str | Path) -> None:
         self.target_index_path = Path(target_index_path).resolve(strict=True)
         self.normalization_path = Path(normalization_path).resolve(strict=True)
         frame = pd.read_parquet(
@@ -150,20 +124,12 @@ class FourSuiteGeometryTargetIndex:
         ).sort_values("lerobot_dataset_index")
         if len(frame) != FOUR_SUITE_FRAMES or not frame["sample_id"].is_unique:
             raise ValueError("four-suite Geometry index has the wrong frame population")
-        if frame["lerobot_dataset_index"].astype(int).tolist() != list(
-            range(FOUR_SUITE_FRAMES)
-        ):
+        if frame["lerobot_dataset_index"].astype(int).tolist() != list(range(FOUR_SUITE_FRAMES)):
             raise ValueError("four-suite Geometry index is not in exact LeRobot order")
         valid = frame["geometry_valid"].astype(bool)
-        if (
-            int(valid.sum()) != FOUR_SUITE_GEOMETRY_VALID
-            or int((~valid).sum()) != FOUR_SUITE_GEOMETRY_INVALID
-        ):
+        if int(valid.sum()) != FOUR_SUITE_GEOMETRY_VALID or int((~valid).sum()) != FOUR_SUITE_GEOMETRY_INVALID:
             raise ValueError("four-suite Geometry validity counts differ")
-        if (
-            frame.loc[valid, "target_memmap_path"].isna().any()
-            or frame.loc[valid, "target_memmap_row"].isna().any()
-        ):
+        if frame.loc[valid, "target_memmap_path"].isna().any() or frame.loc[valid, "target_memmap_row"].isna().any():
             raise ValueError("valid four-suite Geometry rows lack target locations")
         if not frame.loc[valid, "target_dim"].eq(GEOMETRY_DIM).all():
             raise ValueError("four-suite Geometry target dimensions differ")
@@ -184,29 +150,19 @@ class FourSuiteGeometryTargetIndex:
         self.std = np.asarray(normalization["std"], dtype=np.float32)
         if self.mean.shape != (GEOMETRY_DIM,) or self.std.shape != (GEOMETRY_DIM,):
             raise ValueError("four-suite Geometry normalization shape differs")
-        if (
-            not np.isfinite(self.mean).all()
-            or not np.isfinite(self.std).all()
-            or not (self.std > 0).all()
-        ):
+        if not np.isfinite(self.mean).all() or not np.isfinite(self.std).all() or not (self.std > 0).all():
             raise ValueError("four-suite Geometry normalization is invalid")
 
     def _memmap(self, path_value: object) -> np.ndarray:
         path = str(Path(str(path_value)).resolve(strict=True))
         if path not in self._targets:
             targets = np.load(path, mmap_mode="r")
-            if (
-                targets.ndim != 2
-                or targets.shape[1] != GEOMETRY_DIM
-                or targets.dtype != np.float32
-            ):
+            if targets.ndim != 2 or targets.shape[1] != GEOMETRY_DIM or targets.dtype != np.float32:
                 raise ValueError(f"unexpected Geometry memmap shape/dtype: {path}")
             self._targets[path] = targets
         return self._targets[path]
 
-    def target_by_dataset_index(
-        self, dataset_index: int
-    ) -> tuple[np.ndarray | None, bool, str]:
+    def target_by_dataset_index(self, dataset_index: int) -> tuple[np.ndarray | None, bool, str]:
         if dataset_index < 0 or dataset_index >= FOUR_SUITE_FRAMES:
             raise IndexError(dataset_index)
         row = self._frame.iloc[int(dataset_index)]
@@ -222,6 +178,74 @@ class FourSuiteGeometryTargetIndex:
         return target, True, sample_id
 
 
+class FourSuiteMotionTargetIndex:
+    """Read one immutable Motion target memmap by stable sample ID."""
+
+    def __init__(
+        self,
+        target_index_path: str | Path,
+        normalization_path: str | Path,
+        *,
+        expected_count: int = FOUR_SUITE_MOTION_VALID,
+    ) -> None:
+        if expected_count <= 0:
+            raise ValueError("Motion expected_count must be positive")
+        self.target_index_path = Path(target_index_path).resolve(strict=True)
+        self.normalization_path = Path(normalization_path).resolve(strict=True)
+        frame = pd.read_parquet(
+            self.target_index_path,
+            columns=[
+                "sample_id",
+                "target_memmap_path",
+                "target_memmap_row",
+                "target_dim",
+                "target_dtype",
+            ],
+        )
+        if len(frame) != expected_count or not frame["sample_id"].is_unique:
+            raise ValueError(f"Motion target index must cover {expected_count} unique valid samples")
+        if not frame["target_dim"].eq(MOTION_DIM).all() or not frame["target_dtype"].eq("float32").all():
+            raise ValueError("Motion targets must all be float32[256]")
+        rows = frame["target_memmap_row"].astype(np.int64).to_numpy()
+        if not np.array_equal(np.sort(rows), np.arange(expected_count, dtype=np.int64)):
+            raise ValueError("Motion memmap rows must be a permutation of the valid population")
+        paths = frame["target_memmap_path"].drop_duplicates().tolist()
+        if len(paths) != 1:
+            raise ValueError("Motion index must resolve to one immutable target memmap")
+        memmap_path = Path(str(paths[0])).expanduser()
+        if not memmap_path.is_absolute():
+            memmap_path = self.target_index_path.parent / memmap_path
+        self._memmap_path = memmap_path.resolve(strict=True)
+        self._targets = np.load(self._memmap_path, mmap_mode="r")
+        if self._targets.shape != (expected_count, MOTION_DIM) or self._targets.dtype != np.float32:
+            raise ValueError("Unexpected Motion target memmap shape/dtype")
+        self._row_by_sample_id = dict(zip(frame["sample_id"].astype(str), rows, strict=True))
+
+        normalization = json.loads(self.normalization_path.read_text())
+        if (
+            int(normalization.get("count", -1)) != expected_count
+            or normalization.get("dtype") != "float32"
+            or int(normalization.get("feature_dim", -1)) != MOTION_DIM
+            or normalization.get("finite") is not True
+        ):
+            raise ValueError("Motion train normalization metadata differs")
+        self.mean = np.asarray(normalization["mean"], dtype=np.float32)
+        self.std = np.asarray(normalization["std"], dtype=np.float32)
+        if self.mean.shape != (MOTION_DIM,) or self.std.shape != (MOTION_DIM,):
+            raise ValueError("Motion normalization shape differs")
+        if not np.isfinite(self.mean).all() or not np.isfinite(self.std).all() or not (self.std > 0).all():
+            raise ValueError("Motion normalization is invalid")
+
+    def target_by_sample_id(self, sample_id: str) -> tuple[np.ndarray | None, bool]:
+        row = self._row_by_sample_id.get(sample_id)
+        if row is None:
+            return None, False
+        target = np.asarray(self._targets[row], dtype=np.float32)
+        if target.shape != (MOTION_DIM,) or not np.isfinite(target).all():
+            raise ValueError(f"Invalid Motion target for {sample_id}")
+        return target, True
+
+
 class FourSuitePolicyAuxTargetIndex:
     """Join Semantic, Geometry, and Motion targets by immutable sample ID."""
 
@@ -233,33 +257,24 @@ class FourSuitePolicyAuxTargetIndex:
             config.geometry_normalization_path,
         )
         self.motion = (
-            upstream.MotionPolicyTargetIndex(
+            FourSuiteMotionTargetIndex(
                 config.motion_target_index_path,
                 config.motion_normalization_path,
                 expected_count=FOUR_SUITE_MOTION_VALID,
             )
-            if config.mode
-            in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
+            if config.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
             else None
         )
-        self.semantic_tokenizer = upstream.PolicySemanticTokenizer(
-            config.semantic_max_target_len
-        )
+        self.semantic_tokenizer = upstream.PolicySemanticTokenizer(config.semantic_max_target_len)
 
     def item(self, dataset_index: int) -> dict:
         row = self.annotations.row_by_dataset_index(int(dataset_index))
         sample_id = str(row["sample_id"])
-        geometry, geometry_valid, geometry_sample_id = (
-            self.geometry.target_by_dataset_index(int(dataset_index))
-        )
+        geometry, geometry_valid, geometry_sample_id = self.geometry.target_by_dataset_index(int(dataset_index))
         if sample_id != geometry_sample_id:
-            raise ValueError(
-                f"four-suite target identity mismatch at dataset index {dataset_index}"
-            )
+            raise ValueError(f"four-suite target identity mismatch at dataset index {dataset_index}")
         result = {
-            "geometry": geometry
-            if geometry is not None
-            else np.zeros((GEOMETRY_DIM,), dtype=np.float32),
+            "geometry": geometry if geometry is not None else np.zeros((GEOMETRY_DIM,), dtype=np.float32),
             "geometry_valid": np.asarray(geometry_valid, dtype=bool),
             "geometry_mean": self.geometry.mean,
             "geometry_std": self.geometry.std,
@@ -268,9 +283,7 @@ class FourSuitePolicyAuxTargetIndex:
             motion, motion_valid = self.motion.target_by_sample_id(sample_id)
             result.update(
                 {
-                    "motion": motion
-                    if motion is not None
-                    else np.zeros((MOTION_DIM,), dtype=np.float32),
+                    "motion": motion if motion is not None else np.zeros((MOTION_DIM,), dtype=np.float32),
                     "motion_valid": np.asarray(motion_valid, dtype=bool),
                     "motion_mean": self.motion.mean,
                     "motion_std": self.motion.std,

@@ -84,25 +84,16 @@ class SourcePaths:
             openpi_root=_env_path("OPENPI_ROOT", REPO_ROOT),
             lerobot_root=_env_path(
                 "FOUR_SUITE_LEROBOT_ROOT",
-                external_root
-                / "hf/hub/datasets--physical-intelligence--libero/snapshots"
-                / LIBERO_REVISION,
+                external_root / "hf/hub/datasets--physical-intelligence--libero/snapshots" / LIBERO_REVISION,
             ),
             joint_manifest=_env_path(
                 "FOUR_SUITE_JOINT_MANIFEST",
-                external_root
-                / "runtime_metadata/four_suite_policy_geometry_manifest.parquet",
+                external_root / "runtime_metadata/four_suite_policy_geometry_manifest.parquet",
             ),
-            geometry_indices=tuple(
-                root / "target_index.parquet" for root in geometry_roots
-            ),
-            geometry_normalizations=tuple(
-                root / "normalization/train_mean_std.json" for root in geometry_roots
-            ),
+            geometry_indices=tuple(root / "target_index.parquet" for root in geometry_roots),
+            geometry_normalizations=tuple(root / "normalization/train_mean_std.json" for root in geometry_roots),
             motion_indices=tuple(root / "index.parquet" for root in motion_roots),
-            motion_normalizations=tuple(
-                root / "target_statistics_train.json" for root in motion_roots
-            ),
+            motion_normalizations=tuple(root / "target_statistics_train.json" for root in motion_roots),
             artifact_dir=Path(artifact_dir).expanduser().resolve(),
         )
 
@@ -143,6 +134,10 @@ class ArtifactPaths:
         return self.root / "motion_index.parquet"
 
     @property
+    def motion_targets(self) -> Path:
+        return self.root / "motion_targets_fp32.npy"
+
+    @property
     def motion_normalization(self) -> Path:
         return self.root / "motion_normalization.json"
 
@@ -157,6 +152,7 @@ class ArtifactPaths:
             self.geometry_index,
             self.geometry_normalization,
             self.motion_index,
+            self.motion_targets,
             self.motion_normalization,
             self.provenance,
         )

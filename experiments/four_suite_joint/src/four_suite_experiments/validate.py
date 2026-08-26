@@ -8,8 +8,6 @@ from pathlib import Path
 
 import pandas as pd
 
-from openpi.training import policy_aux_dataset as upstream
-
 from .configs import blocked_action_groups
 from .configs import build_train_config
 from .configs import expected_target_scope
@@ -19,6 +17,7 @@ from .constants import FOUR_SUITE_GEOMETRY_VALID
 from .constants import FOUR_SUITE_MOTION_VALID
 from .constants import LIBERO_REVISION
 from .data_overlay import FourSuiteGeometryTargetIndex
+from .data_overlay import FourSuiteMotionTargetIndex
 from .paths import ArtifactPaths
 from .paths import SourcePaths
 from .prepare_joint_artifacts import sha256_file
@@ -29,8 +28,17 @@ def validate_artifacts(artifacts: ArtifactPaths, *, target_scope: str) -> dict:
     if missing:
         raise FileNotFoundError(f"artifact bundle is incomplete: {missing}")
     provenance = json.loads(artifacts.provenance.read_text())
+    motion_storage = provenance.get("motion_storage", {})
     if (
-        provenance.get("status") != "PASS"
+        provenance.get("schema") != "four_suite_joint_artifact_provenance_v2"
+        or motion_storage.get("schema") != "sample_id_to_readonly_memmap_v1"
+        or motion_storage.get("bit_exact") is not True
+        or motion_storage.get("read_only") is not True
+        or int(motion_storage.get("sample_count", -1)) != FOUR_SUITE_MOTION_VALID
+        or int(motion_storage.get("feature_dim", -1)) != 256
+        or motion_storage.get("dtype") != "float32"
+        or int(motion_storage.get("source_shard_count", 0)) <= 0
+        or provenance.get("status") != "PASS"
         or provenance.get("target_scope") != target_scope
     ):
         raise ValueError(
@@ -45,9 +53,7 @@ def validate_artifacts(artifacts: ArtifactPaths, *, target_scope: str) -> dict:
     }
     for key, expected in expected_counts.items():
         if int(provenance.get(key, -1)) != expected:
-            raise ValueError(
-                f"provenance {key} differs: {provenance.get(key)} != {expected}"
-            )
+            raise ValueError(f"provenance {key} differs: {provenance.get(key)} != {expected}")
     for name, expected_hash in provenance.get("artifact_sha256", {}).items():
         path = artifacts.root / name
         observed = sha256_file(path)
@@ -67,7 +73,8 @@ def validate_artifacts(artifacts: ArtifactPaths, *, target_scope: str) -> dict:
         ],
     )
     motion_frame = pd.read_parquet(
-        artifacts.motion_index, columns=["sample_id", "target_shard_path"]
+        artifacts.motion_index,
+        columns=["sample_id", "target_memmap_path", "target_memmap_row"],
     )
     if (
         len(geometry_frame) != FOUR_SUITE_FRAMES
@@ -78,20 +85,21 @@ def validate_artifacts(artifacts: ArtifactPaths, *, target_scope: str) -> dict:
         raise ValueError("Motion index count differs")
     for column, frame in (
         ("target_memmap_path", geometry_frame),
-        ("target_shard_path", motion_frame),
+        ("target_memmap_path", motion_frame),
     ):
         for value in frame[column].dropna().drop_duplicates():
-            if not Path(str(value)).is_file():
-                raise FileNotFoundError(value)
+            path = Path(str(value))
+            if not path.is_absolute():
+                path = artifacts.root / path
+            if not path.is_file():
+                raise FileNotFoundError(path)
 
-    geometry = FourSuiteGeometryTargetIndex(
-        artifacts.geometry_index, artifacts.geometry_normalization
-    )
+    geometry = FourSuiteGeometryTargetIndex(artifacts.geometry_index, artifacts.geometry_normalization)
     for dataset_index in (0, 101_469, FOUR_SUITE_FRAMES - 1):
         target, valid, sample_id = geometry.target_by_dataset_index(dataset_index)
         if valid and target is None:
             raise ValueError(f"Geometry smoke lookup failed: {sample_id}")
-    motion = upstream.MotionPolicyTargetIndex(
+    motion = FourSuiteMotionTargetIndex(
         artifacts.motion_index,
         artifacts.motion_normalization,
         expected_count=FOUR_SUITE_MOTION_VALID,
@@ -107,10 +115,8 @@ def validate_artifacts(artifacts: ArtifactPaths, *, target_scope: str) -> dict:
         "status": "PASS",
         "target_scope": target_scope,
         **expected_counts,
-        "geometry_memmaps": int(
-            geometry_frame["target_memmap_path"].dropna().nunique()
-        ),
-        "motion_shards": int(motion_frame["target_shard_path"].nunique()),
+        "geometry_memmaps": int(geometry_frame["target_memmap_path"].dropna().nunique()),
+        "motion_memmaps": int(motion_frame["target_memmap_path"].nunique()),
     }
 
 
@@ -129,21 +135,14 @@ def validate_lerobot_snapshot(root: Path, *, require_complete: bool) -> dict:
         raise ValueError("LeRobot snapshot episode metadata differs")
     if int(info.get("total_frames", -1)) != FOUR_SUITE_FRAMES:
         raise ValueError("LeRobot snapshot frame metadata differs")
-    episodes = [
-        json.loads(line)
-        for line in episodes_path.read_text().splitlines()
-        if line.strip()
-    ]
+    episodes = [json.loads(line) for line in episodes_path.read_text().splitlines() if line.strip()]
     if len(episodes) != FOUR_SUITE_EPISODES:
         raise ValueError("LeRobot episodes.jsonl population differs")
     chunk_size = int(info.get("chunks_size", 1_000))
     missing = []
     for episode in episodes:
         episode_index = int(episode["episode_index"])
-        path = (
-            root
-            / f"data/chunk-{episode_index // chunk_size:03d}/episode_{episode_index:06d}.parquet"
-        )
+        path = root / f"data/chunk-{episode_index // chunk_size:03d}/episode_{episode_index:06d}.parquet"
         if not path.is_file():
             missing.append(path)
     report = {
@@ -181,9 +180,7 @@ def main() -> None:
     source_paths = SourcePaths.defaults(args.artifact_dir, target_scope=target_scope)
     artifacts = ArtifactPaths(source_paths.artifact_dir)
     report = validate_artifacts(artifacts, target_scope=target_scope)
-    report.update(
-        validate_lerobot_snapshot(source_paths.lerobot_root, require_complete=False)
-    )
+    report.update(validate_lerobot_snapshot(source_paths.lerobot_root, require_complete=False))
     config = build_train_config(
         variant=args.variant,
         artifacts=artifacts,
