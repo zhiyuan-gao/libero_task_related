@@ -24,6 +24,8 @@ LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
 # LIBERO's simulator exposes the same tasks in a different order, so their
 # benchmark IDs are (4, 2, 3), respectively.
 LIBERO3_BENCHMARK_TASK_IDS = (4, 2, 3)
+LIBERO_FULL_SUITE_NAMES = ("libero_spatial", "libero_object", "libero_goal", "libero_10")
+LIBERO_FULL_SUITE_TASK_IDS = tuple(range(10))
 
 
 @dataclasses.dataclass
@@ -44,9 +46,8 @@ class Args:
     )
     num_steps_wait: int = 10  # Number of steps to wait for objects to stabilize i n sim
     num_trials_per_task: int = 50  # Number of rollouts per task
-    # Formal evaluation is the frozen three-task population corresponding to
-    # LeRobot task indices (0, 3, 8). Debug runs may override this with
-    # ``--no-formal``.
+    # Formal evaluation accepts either the frozen three-task LIBERO-10
+    # population or all ten tasks in one of the four standard suites.
     task_ids: typing.Tuple[int, ...] = LIBERO3_BENCHMARK_TASK_IDS  # noqa: UP006 -- evaluator runs on Python 3.8
     # Deterministic global sharding over (task position, episode index). This
     # lets multiple workers evaluate disjoint initial states without changing
@@ -71,7 +72,6 @@ def _validate_formal_protocol(args: Args) -> None:
     if not args.formal:
         return
     expected = {
-        "task_suite_name": "libero_10",
         "resize_size": 224,
         "replan_steps": 5,
         "num_steps_wait": 10,
@@ -84,11 +84,16 @@ def _validate_formal_protocol(args: Args) -> None:
             "Formal LIBERO evaluation parameters are frozen. "
             f"expected={expected}, observed={observed}. Use --no-formal only for smoke/debug evaluation."
         )
-    if tuple(args.task_ids) != LIBERO3_BENCHMARK_TASK_IDS:
+    task_ids = tuple(args.task_ids)
+    valid_population = (args.task_suite_name == "libero_10" and task_ids == LIBERO3_BENCHMARK_TASK_IDS) or (
+        args.task_suite_name in LIBERO_FULL_SUITE_NAMES and task_ids == LIBERO_FULL_SUITE_TASK_IDS
+    )
+    if not valid_population:
         raise ValueError(
-            "Formal subset evaluation is frozen to LIBERO benchmark task IDs "
-            f"{LIBERO3_BENCHMARK_TASK_IDS}, corresponding to LeRobot task indices (0, 3, 8); "
-            f"observed={tuple(args.task_ids)}."
+            "Formal LIBERO evaluation requires either the frozen LIBERO-3 subset "
+            f"({LIBERO3_BENCHMARK_TASK_IDS}) in libero_10 or all ten tasks "
+            f"({LIBERO_FULL_SUITE_TASK_IDS}) in one of {LIBERO_FULL_SUITE_NAMES}; "
+            f"observed suite={args.task_suite_name}, task_ids={task_ids}."
         )
     if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
         raise ValueError(f"Invalid evaluation shard: shard_index={args.shard_index}, num_shards={args.num_shards}")
@@ -154,6 +159,8 @@ def eval_libero(args: Args) -> None:
     logging.info(f"Benchmark task IDs: {task_ids}")
     if task_ids == LIBERO3_BENCHMARK_TASK_IDS:
         logging.info("Frozen LeRobot task mapping: 0->4, 3->2, 8->3")
+    elif task_ids == LIBERO_FULL_SUITE_TASK_IDS:
+        logging.info("Frozen full-suite benchmark task order: 0,1,2,3,4,5,6,7,8,9")
     logging.info(f"Evaluation shard: {args.shard_index}/{args.num_shards}")
 
     video_out_path = pathlib.Path(args.video_out_path)
@@ -308,6 +315,7 @@ def eval_libero(args: Args) -> None:
                 _append_jsonl(
                     output_jsonl,
                     {
+                        "task_suite_name": args.task_suite_name,
                         "task_id": task_id,
                         "task_position": task_position,
                         "task_description": str(task_description),
