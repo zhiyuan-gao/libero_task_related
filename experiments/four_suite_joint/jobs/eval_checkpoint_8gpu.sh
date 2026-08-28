@@ -194,6 +194,7 @@ for suite in "${suites[@]}"; do
   mkdir -p "${suite_root}/results" "${suite_root}/videos" "${suite_root}/logs"
   client_pids=()
   for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+    gpu=$((shard % NUM_GPUS))
     cpu_set="$(cpu_set_for_worker "${shard}")"
     video_arg="--args.no-save-video"
     [[ "${SAVE_VIDEO}" == 1 ]] && video_arg="--args.save-video"
@@ -203,8 +204,8 @@ for suite in "${suites[@]}"; do
       TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
       MUJOCO_GL=egl \
       PYOPENGL_PLATFORM=egl \
-      EGL_DEVICE_ID="${shard}" \
-      MUJOCO_EGL_DEVICE_ID="${shard}" \
+      EGL_DEVICE_ID="${gpu}" \
+      MUJOCO_EGL_DEVICE_ID="${gpu}" \
       OMP_NUM_THREADS="${threads_per_process}" \
       MKL_NUM_THREADS="${threads_per_process}" \
       OPENBLAS_NUM_THREADS="${threads_per_process}" \
