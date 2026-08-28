@@ -18,8 +18,10 @@ RESUME="${RESUME:-1}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 TORCH_COMPILE_CACHE_ROOT="${TORCH_COMPILE_CACHE_ROOT:-${RUN_ROOT}/torch_compile_cache}"
+NUM_SHARDS="${NUM_SHARDS:-16}"
 
-readonly NUM_SHARDS=8
+readonly NUM_GPUS=8
+readonly NUM_SHARDS
 readonly CHECKPOINT_STEP="$(basename "${CHECKPOINT}")"
 task_ids=(0 1 2 3 4 5 6 7 8 9)
 suites=(libero_spatial libero_object libero_goal libero_10)
@@ -42,7 +44,15 @@ for required in assets bddl_files init_files; do
     exit 2
   fi
 done
-if [[ "${PORT_BASE}" -lt 1024 || $((PORT_BASE + 7)) -gt 65535 ]]; then
+if [[ ! "${NUM_SHARDS}" =~ ^[0-9]+$ ]]; then
+  echo "NUM_SHARDS must be an integer; observed ${NUM_SHARDS}" >&2
+  exit 2
+fi
+if ((NUM_SHARDS < NUM_GPUS || NUM_SHARDS % NUM_GPUS != 0)); then
+  echo "NUM_SHARDS must be a positive multiple of ${NUM_GPUS}; observed ${NUM_SHARDS}" >&2
+  exit 2
+fi
+if [[ "${PORT_BASE}" -lt 1024 || $((PORT_BASE + NUM_SHARDS - 1)) -gt 65535 ]]; then
   echo "Invalid PORT_BASE: ${PORT_BASE}" >&2
   exit 2
 fi
@@ -58,7 +68,7 @@ suites=libero_spatial,libero_object,libero_goal,libero_10
 task_ids=0,1,2,3,4,5,6,7,8,9
 trials_per_task=50
 seed=7
-num_shards=8
+num_shards=${NUM_SHARDS}
 resize=224
 replan_steps=5
 policy_flow_steps=10
@@ -66,7 +76,7 @@ protocol=formal_four_suite"
 
 if [[ "${DRY_RUN}" == 1 ]]; then
   echo "DRY RUN OK: checkpoint=${CHECKPOINT_STEP} variant=${VARIANT}"
-  echo "Would launch eight GPU policy workers and 2,000 formal rollouts across four suites."
+  echo "Would launch ${NUM_SHARDS} policy workers across ${NUM_GPUS} GPUs and 2,000 formal rollouts across four suites."
   exit 0
 fi
 
@@ -106,39 +116,40 @@ cores_per_pair=$((cpu_count / NUM_SHARDS))
 threads_per_process=$((cores_per_pair / 2))
 ((threads_per_process >= 1)) || threads_per_process=1
 
-cpu_set_for_gpu() {
-  local gpu="$1"
-  if ((cpu_count == 128)); then
-    case "${gpu}" in
-      0) echo "0-7,64-71" ;;
-      1) echo "8-15,72-79" ;;
-      2) echo "16-23,80-87" ;;
-      3) echo "24-31,88-95" ;;
-      4) echo "32-39,96-103" ;;
-      5) echo "40-47,104-111" ;;
-      6) echo "48-55,112-119" ;;
-      7) echo "56-63,120-127" ;;
-    esac
+cpu_set_for_worker() {
+  local worker="$1"
+  local gpu=$((worker % NUM_GPUS))
+  local replica=$((worker / NUM_GPUS))
+  local replicas_per_gpu=$((NUM_SHARDS / NUM_GPUS))
+  if ((cpu_count == 128 && 8 % replicas_per_gpu == 0)); then
+    local physical_cores_per_pair=$((8 / replicas_per_gpu))
+    local first_core=$((gpu * 8 + replica * physical_cores_per_pair))
+    local last_core=$((first_core + physical_cores_per_pair - 1))
+    echo "${first_core}-${last_core},$((first_core + 64))-$((last_core + 64))"
     return
   fi
-  local first_core=$((gpu * cores_per_pair))
+  local first_core=$((worker * cores_per_pair))
   local last_core=$((first_core + cores_per_pair - 1))
   ((last_core < cpu_count)) || last_core=$((cpu_count - 1))
   echo "${first_core}-${last_core}"
 }
 
 export PYTHONPATH="${PROJECT_ROOT}/src:${OPENPI_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
-for gpu in $(seq 0 7); do
-  port=$((PORT_BASE + gpu))
-  cpu_set="$(cpu_set_for_gpu "${gpu}")"
-  mkdir -p "${TORCH_COMPILE_CACHE_ROOT}/gpu${gpu}/inductor" "${TORCH_COMPILE_CACHE_ROOT}/gpu${gpu}/triton"
+for worker in $(seq 0 $((NUM_SHARDS - 1))); do
+  gpu=$((worker % NUM_GPUS))
+  replica=$((worker / NUM_GPUS))
+  port=$((PORT_BASE + worker))
+  cpu_set="$(cpu_set_for_worker "${worker}")"
+  cache_leaf="gpu${gpu}"
+  ((replica == 0)) || cache_leaf="gpu${gpu}_replica${replica}"
+  mkdir -p "${TORCH_COMPILE_CACHE_ROOT}/${cache_leaf}/inductor" "${TORCH_COMPILE_CACHE_ROOT}/${cache_leaf}/triton"
   env \
     CUDA_VISIBLE_DEVICES="${gpu}" \
     OMP_NUM_THREADS="${threads_per_process}" \
     MKL_NUM_THREADS="${threads_per_process}" \
     OPENBLAS_NUM_THREADS="${threads_per_process}" \
-    TORCHINDUCTOR_CACHE_DIR="${TORCH_COMPILE_CACHE_ROOT}/gpu${gpu}/inductor" \
-    TRITON_CACHE_DIR="${TORCH_COMPILE_CACHE_ROOT}/gpu${gpu}/triton" \
+    TORCHINDUCTOR_CACHE_DIR="${TORCH_COMPILE_CACHE_ROOT}/${cache_leaf}/inductor" \
+    TRITON_CACHE_DIR="${TORCH_COMPILE_CACHE_ROOT}/${cache_leaf}/triton" \
     taskset -c "${cpu_set}" \
     "${PYTHON_BIN}" -m four_suite_experiments.serve \
       --variant "${VARIANT}" \
@@ -148,29 +159,29 @@ for gpu in $(seq 0 7); do
       --libero-assets-dir "${LIBERO_ASSETS_DIR}" \
       --port "${port}" \
       --num-steps 10 \
-      >"${RUN_ROOT}/logs/server_gpu${gpu}.log" 2>&1 &
+      >"${RUN_ROOT}/logs/server_worker${worker}_gpu${gpu}.log" 2>&1 &
   server_pids+=("$!")
 done
 
 ready=0
 for _ in $(seq 1 300); do
   ready=0
-  for gpu in $(seq 0 7); do
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:$((PORT_BASE + gpu))/healthz" >/dev/null; then
+  for worker in $(seq 0 $((NUM_SHARDS - 1))); do
+    if curl --silent --fail --max-time 1 "http://127.0.0.1:$((PORT_BASE + worker))/healthz" >/dev/null; then
       ready=$((ready + 1))
     fi
   done
-  [[ "${ready}" -eq 8 ]] && break
+  [[ "${ready}" -eq "${NUM_SHARDS}" ]] && break
   for pid in "${server_pids[@]}"; do
     if ! kill -0 "${pid}" 2>/dev/null; then
-      echo "A policy server exited before readiness; inspect ${RUN_ROOT}/logs/server_gpu*.log" >&2
+      echo "A policy server exited before readiness; inspect ${RUN_ROOT}/logs/server_worker*.log" >&2
       exit 1
     fi
   done
   sleep 1
 done
-if [[ "${ready}" -ne 8 ]]; then
-  echo "Only ${ready}/8 policy servers became ready within 300 seconds" >&2
+if [[ "${ready}" -ne "${NUM_SHARDS}" ]]; then
+  echo "Only ${ready}/${NUM_SHARDS} policy servers became ready within 300 seconds" >&2
   exit 1
 fi
 
@@ -182,8 +193,8 @@ for suite in "${suites[@]}"; do
   fi
   mkdir -p "${suite_root}/results" "${suite_root}/videos" "${suite_root}/logs"
   client_pids=()
-  for shard in $(seq 0 7); do
-    cpu_set="$(cpu_set_for_gpu "${shard}")"
+  for shard in $(seq 0 $((NUM_SHARDS - 1))); do
+    cpu_set="$(cpu_set_for_worker "${shard}")"
     video_arg="--args.no-save-video"
     [[ "${SAVE_VIDEO}" == 1 ]] && video_arg="--args.save-video"
     env \

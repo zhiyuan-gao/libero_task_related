@@ -6,21 +6,23 @@ from four_suite_experiments.constants import SUITES
 from four_suite_experiments.summarize_eval import summarize_batch
 from four_suite_experiments.summarize_eval import summarize_checkpoint
 from four_suite_experiments.summarize_eval import summarize_suite
+import pytest
 
 
-def test_formal_suite_checkpoint_and_batch_summaries(tmp_path) -> None:
-    shard_paths = [tmp_path / f"shard_{index}.jsonl" for index in range(8)]
+@pytest.mark.parametrize("num_shards", [8, 16])
+def test_formal_suite_checkpoint_and_batch_summaries(tmp_path, num_shards: int) -> None:
+    shard_paths = [tmp_path / f"shard_{index}.jsonl" for index in range(num_shards)]
     handles = [path.open("w", encoding="utf-8") for path in shard_paths]
     try:
         for task_id in range(10):
             for episode_idx in range(50):
-                shard = (task_id * 50 + episode_idx) % 8
+                shard = (task_id * 50 + episode_idx) % num_shards
                 record = {
                     "task_suite_name": "libero_spatial",
                     "task_id": task_id,
                     "episode_idx": episode_idx,
                     "shard_index": shard,
-                    "num_shards": 8,
+                    "num_shards": num_shards,
                     "seed": 7,
                     "success": episode_idx % 2 == 0,
                     "error": None,

@@ -10,7 +10,6 @@ from .constants import SUITES
 
 TASK_IDS = tuple(range(10))
 TRIALS_PER_TASK = 50
-NUM_SHARDS = 8
 SEED = 7
 MAX_STEPS = {
     "libero_spatial": 220,
@@ -47,15 +46,22 @@ def summarize_suite(suite: str, inputs: list[Path]) -> dict:
         extra = sorted(set(observed) - expected)
         raise SystemExit(f"{suite} evaluation is incomplete: missing={missing}, extra={extra}")
 
+    shard_counts = {int(record["num_shards"]) for record in records}
+    if len(shard_counts) != 1:
+        raise SystemExit(f"{suite} evaluation mixes shard counts: {sorted(shard_counts)}")
+    num_shards = shard_counts.pop()
+    if num_shards < 1:
+        raise SystemExit(f"{suite} evaluation has an invalid shard count: {num_shards}")
+
     by_task = {}
     for task_position, task_id in enumerate(TASK_IDS):
         task_records = [record for record in records if int(record["task_id"]) == task_id]
         for record in task_records:
             episode_idx = int(record["episode_idx"])
-            expected_shard = (task_position * TRIALS_PER_TASK + episode_idx) % NUM_SHARDS
+            expected_shard = (task_position * TRIALS_PER_TASK + episode_idx) % num_shards
             if record.get("task_suite_name") != suite:
                 raise SystemExit(f"Suite identity mismatch in record: {record}")
-            if int(record["shard_index"]) != expected_shard or int(record["num_shards"]) != NUM_SHARDS:
+            if int(record["shard_index"]) != expected_shard or int(record["num_shards"]) != num_shards:
                 raise SystemExit(f"Invalid shard assignment in record: {record}")
             if int(record["seed"]) != SEED or record.get("error") is not None:
                 raise SystemExit(f"Invalid formal record: {record}")
@@ -74,7 +80,7 @@ def summarize_suite(suite: str, inputs: list[Path]) -> dict:
             "benchmark_task_ids": list(TASK_IDS),
             "seed": SEED,
             "trials_per_task": TRIALS_PER_TASK,
-            "num_shards": NUM_SHARDS,
+            "num_shards": num_shards,
             "max_steps": MAX_STEPS[suite],
             "wait_steps": 10,
             "resize": 224,

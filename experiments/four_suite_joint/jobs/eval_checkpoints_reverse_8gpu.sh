@@ -8,6 +8,8 @@ CHECKPOINT_ROOT="${CHECKPOINT_ROOT:?Set CHECKPOINT_ROOT to the completed LIBERO-
 BATCH_ROOT="${BATCH_ROOT:?Set BATCH_ROOT to a new or resumable evaluation directory}"
 RESUME="${RESUME:-1}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
+NUM_SHARDS="${NUM_SHARDS:-16}"
+COMPILE_CACHE_ROOT="${TORCH_COMPILE_CACHE_ROOT:-${BATCH_ROOT}/torch_compile_cache}"
 
 # The reviewed sweep intentionally covers only the newest ten checkpoints.
 steps=(30000 29500 29000 28500 28000 27500 27000 26500 26000 25500)
@@ -36,7 +38,8 @@ for index in "${!steps[@]}"; do
   PORT_BASE=8400 \
   RESUME="${RESUME}" \
   SAVE_VIDEO="${SAVE_VIDEO}" \
-  TORCH_COMPILE_CACHE_ROOT="${BATCH_ROOT}/torch_compile_cache" \
+  NUM_SHARDS="${NUM_SHARDS}" \
+  TORCH_COMPILE_CACHE_ROOT="${COMPILE_CACHE_ROOT}" \
     "${PROJECT_ROOT}/jobs/eval_checkpoint_8gpu.sh"
 done
 
