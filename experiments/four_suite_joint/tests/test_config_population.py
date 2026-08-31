@@ -220,9 +220,21 @@ def test_eval_launcher_routes_24_simulators_to_eight_policy_servers(tmp_path) ->
             "FOUR_SUITE_LIBERO_ASSETS": str(tmp_path / "assets"),
             "LIBERO_EVAL_SOURCE_ROOT": str(tmp_path / "libero_source"),
             "NUM_SHARDS": "24",
+            "ALLOW_EXPERIMENTAL_WORKER_COUNT": "1",
             "DRY_RUN": "1",
         }
     )
+    formal_env = env.copy()
+    formal_env.pop("ALLOW_EXPERIMENTAL_WORKER_COUNT")
+    rejected = subprocess.run(
+        ["bash", str(launcher)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=formal_env,
+    )
+    assert rejected.returncode == 2
+    assert "Formal LIBERO-40 evaluation is fixed at NUM_SHARDS=16" in rejected.stderr
     result = subprocess.run(
         ["bash", str(launcher)],
         check=True,
@@ -234,6 +246,12 @@ def test_eval_launcher_routes_24_simulators_to_eight_policy_servers(tmp_path) ->
     text = launcher.read_text()
     assert "for gpu in $(seq 0 $((NUM_POLICY_SERVERS - 1)))" in text
     assert '--args.port "$((PORT_BASE + gpu))"' in text
+
+
+def test_formal_eval_launchers_are_fixed_to_16_workers() -> None:
+    jobs = Path(__file__).resolve().parents[1] / "jobs"
+    for name in ("eval_checkpoints_reverse_8gpu.sh", "eval_selected_multiseed_8gpu.sh"):
+        assert "readonly NUM_SHARDS=16" in (jobs / name).read_text()
 
 
 def test_official_completion_continuation_is_one_continuous_6k_schedule(tmp_path) -> None:

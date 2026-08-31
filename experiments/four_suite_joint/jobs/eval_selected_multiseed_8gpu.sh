@@ -6,7 +6,7 @@ CHECKPOINT_ROOT="${CHECKPOINT_ROOT:?Set CHECKPOINT_ROOT to the completed LIBERO-
 BATCH_ROOT="${BATCH_ROOT:?Set BATCH_ROOT to a new or resumable evaluation directory}"
 RESUME="${RESUME:-1}"
 SAVE_VIDEO="${SAVE_VIDEO:-0}"
-NUM_SHARDS="${NUM_SHARDS:-16}"
+readonly NUM_SHARDS=16
 COMPILE_CACHE_ROOT="${TORCH_COMPILE_CACHE_ROOT:-${BATCH_ROOT}/torch_compile_cache}"
 
 # Requested late checkpoints and the two established alternate LIBERO seeds.

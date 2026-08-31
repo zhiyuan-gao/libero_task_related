@@ -20,6 +20,7 @@ DRY_RUN="${DRY_RUN:-0}"
 TORCH_COMPILE_CACHE_ROOT="${TORCH_COMPILE_CACHE_ROOT:-${RUN_ROOT}/torch_compile_cache}"
 NUM_SHARDS="${NUM_SHARDS:-16}"
 EVAL_SEED="${EVAL_SEED:-7}"
+ALLOW_EXPERIMENTAL_WORKER_COUNT="${ALLOW_EXPERIMENTAL_WORKER_COUNT:-0}"
 
 readonly NUM_GPUS=8
 readonly NUM_POLICY_SERVERS="${NUM_GPUS}"
@@ -58,6 +59,10 @@ if ((NUM_SHARDS != 8 && NUM_SHARDS != 16 && NUM_SHARDS != 24)); then
   echo "NUM_SHARDS must be one of 8, 16, or 24 simulator workers; observed ${NUM_SHARDS}" >&2
   exit 2
 fi
+if ((NUM_SHARDS != 16)) && [[ "${ALLOW_EXPERIMENTAL_WORKER_COUNT}" != 1 ]]; then
+  echo "Formal LIBERO-40 evaluation is fixed at NUM_SHARDS=16. Set ALLOW_EXPERIMENTAL_WORKER_COUNT=1 only for non-formal scaling smoke tests." >&2
+  exit 2
+fi
 if [[ "${PORT_BASE}" -lt 1024 || $((PORT_BASE + NUM_POLICY_SERVERS - 1)) -gt 65535 ]]; then
   echo "Invalid PORT_BASE: ${PORT_BASE}" >&2
   exit 2
@@ -72,6 +77,9 @@ alternate_seed_arg=()
 if [[ "${EVAL_SEED}" != 7 ]]; then
   protocol="formal_four_suite_multiseed"
   alternate_seed_arg=(--args.allow-alternate-formal-seed)
+fi
+if ((NUM_SHARDS != 16)); then
+  protocol="experimental_worker_scaling"
 fi
 
 manifest="checkpoint=${CHECKPOINT}
