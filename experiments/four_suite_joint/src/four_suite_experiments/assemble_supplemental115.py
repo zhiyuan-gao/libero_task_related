@@ -246,7 +246,6 @@ def _assemble_artifacts(
     *,
     bundle: Path,
     temporary_output: Path,
-    final_output: Path,
     spec: PopulationSpec,
 ) -> None:
     source = bundle / "training_artifacts/task_relevant"
@@ -311,8 +310,7 @@ def _assemble_artifacts(
     selected_rows = selected_geometry.loc[selected_valid, "target_memmap_row"].astype(np.int64).to_numpy()
     if not np.array_equal(selected_rows, np.arange(spec.target_geometry_valid)):
         raise ValueError("supplemental-115 Geometry targets are not a source prefix")
-    geometry_target_final = final_output / "geometry_targets_fp32.npy"
-    selected_geometry.loc[selected_valid, "target_memmap_path"] = str(geometry_target_final)
+    selected_geometry.loc[selected_valid, "target_memmap_path"] = "geometry_targets_fp32.npy"
     selected_geometry.to_parquet(temporary_output / "geometry_index.parquet", index=False, compression="zstd")
     _copy_npy_prefix(
         source / "geometry_targets_fp32.npy",
@@ -449,7 +447,6 @@ def assemble_supplemental115(
         _assemble_artifacts(
             bundle=bundle,
             temporary_output=temporary_artifacts,
-            final_output=output / "artifacts/task_relevant",
             spec=spec,
         )
         report = _validate_output(root=temporary, spec=spec)

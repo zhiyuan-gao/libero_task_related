@@ -195,7 +195,10 @@ class FourSuiteGeometryTargetIndex:
             raise ValueError("four-suite Geometry normalization is invalid")
 
     def _memmap(self, path_value: object) -> np.ndarray:
-        path = str(Path(str(path_value)).resolve(strict=True))
+        target_path = Path(str(path_value)).expanduser()
+        if not target_path.is_absolute():
+            target_path = self.target_index_path.parent / target_path
+        path = str(target_path.resolve(strict=True))
         if path not in self._targets:
             targets = np.load(path, mmap_mode="r")
             if targets.ndim != 2 or targets.shape[1] != GEOMETRY_DIM or targets.dtype != np.float32:

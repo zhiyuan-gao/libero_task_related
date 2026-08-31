@@ -5,6 +5,8 @@ from pathlib import Path
 
 from four_suite_experiments.assemble_supplemental115 import PopulationSpec
 from four_suite_experiments.assemble_supplemental115 import assemble_supplemental115
+from four_suite_experiments.constants import GEOMETRY_DIM
+from four_suite_experiments.data_overlay import FourSuiteGeometryTargetIndex
 import numpy as np
 import pandas as pd
 import pytest
@@ -197,9 +199,7 @@ def test_assemble_supplemental115_selects_exact_prefix_without_modifying_sources
         motion_targets[:4],
     )
     geometry = pd.read_parquet(output / "artifacts/task_relevant/geometry_index.parquet")
-    assert set(geometry.loc[geometry["geometry_valid"], "target_memmap_path"]) == {
-        str(output / "artifacts/task_relevant/geometry_targets_fp32.npy")
-    }
+    assert set(geometry.loc[geometry["geometry_valid"], "target_memmap_path"]) == {"geometry_targets_fp32.npy"}
     assert json.loads((output / "artifacts/task_relevant/provenance.json").read_text())["selection"][
         "episode_indices"
     ] == [2, 2]
@@ -233,3 +233,44 @@ def test_assemble_supplemental115_rejects_nonprefix_motion_targets(tmp_path) -> 
             spec=spec,
         )
     assert not (tmp_path / "assembled").exists()
+
+
+def test_geometry_target_index_resolves_portable_relative_memmap(tmp_path) -> None:
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    targets = np.arange(GEOMETRY_DIM, dtype=np.float32).reshape(1, GEOMETRY_DIM)
+    np.save(artifacts / "geometry_targets_fp32.npy", targets)
+    pd.DataFrame(
+        {
+            "lerobot_dataset_index": [0],
+            "sample_id": ["sample-0"],
+            "geometry_valid": [True],
+            "target_memmap_path": ["geometry_targets_fp32.npy"],
+            "target_memmap_row": [0],
+            "target_dim": [GEOMETRY_DIM],
+            "target_dtype": ["float32"],
+        }
+    ).to_parquet(artifacts / "geometry_index.parquet", index=False)
+    _write_json(
+        artifacts / "geometry_normalization.json",
+        {
+            "status": "PASS",
+            "split": "train",
+            "sample_count": 1,
+            "feature_dim": GEOMETRY_DIM,
+            "mean": [0.0] * GEOMETRY_DIM,
+            "std": [1.0] * GEOMETRY_DIM,
+        },
+    )
+
+    index = FourSuiteGeometryTargetIndex(
+        artifacts / "geometry_index.parquet",
+        artifacts / "geometry_normalization.json",
+        expected_frames=1,
+        expected_valid=1,
+        expected_invalid=0,
+    )
+    observed, valid, sample_id = index.target_by_dataset_index(0)
+    assert valid is True
+    assert sample_id == "sample-0"
+    assert np.array_equal(observed, targets[0])

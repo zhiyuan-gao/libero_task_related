@@ -95,6 +95,63 @@ delta parquets and corresponding rows in the combined Geometry/Motion targets
 preserve the training inputs. Do not include all 239 additions when reproducing
 the adopted supplemental-115 result.
 
+## Reproduce the 1,808-episode continuation population
+
+Download only the frozen completion bundle in addition to the public base
+snapshot. The moving asset-repository head must not be used:
+
+```bash
+uvx --from 'huggingface_hub>=1.0' hf download \
+  Zhiyuan17/libero40-trqc-assets \
+  --repo-type dataset \
+  --revision official-completion-1932-v1 \
+  --include 'official_completion_1932_v1/**' \
+  --local-dir "$LIBERO40_ROOT/completion_bundle"
+```
+
+The checked-in assembler selects exactly the first 115 additions, combines
+them with the immutable public base, trims the combined Geometry and Motion
+stores to the exact matching prefixes, keeps all target paths relocatable, and
+validates every frozen population count. It never changes either input and
+refuses to overwrite an existing output:
+
+```bash
+cd "$LIBERO40_ROOT/libero_task_related/experiments/four_suite_joint"
+./jobs/run_8gpu.sh assemble-supplemental115 \
+  --base-root "$FOUR_SUITE_LEROBOT_ROOT" \
+  --bundle-root "$LIBERO40_ROOT/completion_bundle/official_completion_1932_v1" \
+  --output-root "$LIBERO40_ROOT/prepared/supplemental115"
+```
+
+A successful `assembly_report.json` must report 1,808 episodes, 299,892
+frames, 299,796 valid Geometry rows, and 281,667 valid Motion rows. The policy
+dataset is at `lerobot/a4336d589d589045d1c56423ffdf3b88a0e19b1f`; its matching
+targets are at `artifacts/task_relevant`.
+
+The adopted training stage is a strict model warm start from main step 30,000,
+with a new AdamW optimizer, 3,000 updates, 200 warmup updates, peak LR `1e-5`,
+cosine decay to `1e-6`, and checkpoints every 500 updates. All other formal
+TRQC settings remain unchanged. After reviewing paths and budget, launch it
+inside an eight-GPU Slurm allocation with:
+
+```bash
+sbatch --account=ACCOUNT --partition=PARTITION --time=TIME --mem=MEMORY \
+  --export=ALL,FOUR_SUITE_HPC_ENV_FILE="$PWD/hpc.env",FOUR_SUITE_SUPPLEMENTAL_FINETUNE_APPROVED=YES \
+  jobs/slurm_8gpu.sbatch supplemental-finetune \
+    --lerobot-root "$LIBERO40_ROOT/prepared/supplemental115/lerobot/a4336d589d589045d1c56423ffdf3b88a0e19b1f" \
+    --artifact-dir "$LIBERO40_ROOT/prepared/supplemental115/artifacts/task_relevant" \
+    --parent-checkpoint "$LIBERO40_ROOT/checkpoints/pi05_libero40_trqc/libero40_trqc_seed42/30000" \
+    --libero-assets-dir "$FOUR_SUITE_LIBERO_ASSETS" \
+    --exp-name libero40_trqc_supplemental115_from30000_seed42 \
+    --num-updates 3000 \
+    --disable-wandb
+```
+
+This command does not start closed-loop evaluation. The historical two-stage
+1,932/old-115 controller, its approval gates, and the distinction between
+evaluation-only weights and exact-resume payloads are documented in
+[`experiments/four_suite_joint/DUAL_CONTINUATION.md`](experiments/four_suite_joint/DUAL_CONTINUATION.md).
+
 ## Required HPC environment
 
 - Linux x86_64 with Git and `curl`
