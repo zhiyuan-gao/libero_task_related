@@ -27,7 +27,7 @@ Every variant has eight Geometry queries and eight Motion queries. Grounding is
 disabled. `no_query_access` changes only the Action Expert attention access;
 its targets and losses are identical to `trqc`.
 
-The candidate formal recipe is 30,000 optimizer updates, 10,000 warmup
+The formal recipe is 30,000 optimizer updates, 10,000 warmup
 updates, global batch 256, seed 42, BF16, AdamW, gradient clipping at 1.0, and
 no EMA. Training saves every 1,000 updates through step 20,000, then every 500
 updates through step 30,000. A rolling cap retains 30 evaluation models, so the
@@ -36,6 +36,41 @@ Only the newest two checkpoints retain AdamW, RNG, sampler, and DataLoader state
 for exact continuation; older retained checkpoints are evaluation-only. Formal
 training is gated and is never started by installation,
 download, preparation, testing, or preflight commands.
+
+## Best completed result
+
+The adopted checkpoint is the `trqc` main run at step 30,000 followed by 3,000
+continuation updates on the original 1,693 LeRobot episodes plus 115
+replay-validated supplemental episodes (1,808 episodes total). The auxiliary
+architecture and loss coefficients are unchanged during continuation.
+
+Evaluation uses seed 7, 50 trials per task, and all 40 tasks (2,000 closed-loop
+rollouts total):
+
+| Suite | Successes | Trials | Success rate |
+| --- | ---: | ---: | ---: |
+| LIBERO-Spatial | 500 | 500 | 100.0% |
+| LIBERO-Object | 493 | 500 | 98.6% |
+| LIBERO-Goal | 489 | 500 | 97.8% |
+| LIBERO-10 | 475 | 500 | 95.0% |
+| **Overall** | **1,957** | **2,000** | **97.85%** |
+
+The protocol uses 224 x 224 policy input, 10 flow steps, replanning every 5
+environment steps, 10 initial wait steps, and 16 evaluation shards. Maximum
+episode lengths are 220 / 280 / 300 / 520 for Spatial / Object / Goal /
+LIBERO-10 respectively.
+
+The public checkpoint archive is
+[`Zhiyuan17/libero40-trqc-checkpoints`](https://huggingface.co/Zhiyuan17/libero40-trqc-checkpoints).
+The adopted model is
+[`pi05_libero40_trqc_supplemental115_from30000_seed42/3000`](https://huggingface.co/Zhiyuan17/libero40-trqc-checkpoints/tree/main/checkpoints/pi05_libero40_trqc_supplemental115_from30000_seed42/3000),
+and its `model.safetensors` SHA256 is
+`5396113cca6fff16fd8a6d77f28530cb31827105b69f632b07de1787dce1234e`.
+The archive also contains the original step-30,000 exact-resume checkpoint,
+the retained complete-1,932-data continuation checkpoint, all per-task result
+JSON files, and a complete SHA256 manifest. See the
+[`step-3000 result JSON`](https://huggingface.co/Zhiyuan17/libero40-trqc-checkpoints/blob/main/results/supplemental115_step3000_summary.json)
+for task-level counts.
 
 ## Required HPC environment
 
