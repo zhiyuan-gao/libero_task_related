@@ -72,6 +72,29 @@ JSON files, and a complete SHA256 manifest. See the
 [`step-3000 result JSON`](https://huggingface.co/Zhiyuan17/libero40-trqc-checkpoints/blob/main/results/supplemental115_step3000_summary.json)
 for task-level counts.
 
+## Data and cache archives
+
+The policy data, teacher targets, and checkpoints are archived separately so
+the public LeRobot dataset is not duplicated inside the research-asset bundle.
+
+| Component | Frozen Hugging Face source | Access |
+| --- | --- | --- |
+| Main 1,693-episode / 273,465-frame policy dataset | [`physical-intelligence/libero@a4336d5`](https://huggingface.co/datasets/physical-intelligence/libero/tree/a4336d589d589045d1c56423ffdf3b88a0e19b1f) | Public |
+| FP32-converted pi0.5 base, normalization, Semantic/identity manifest, and task-relevant Geometry/Motion caches | [`Zhiyuan17/libero40-trqc-assets@task-relevant-v1`](https://huggingface.co/datasets/Zhiyuan17/libero40-trqc-assets/tree/task-relevant-v1) | Private; HF login required |
+| Complete task-relevant plus Whole-scene Geometry/Motion cache release | [`Zhiyuan17/libero40-trqc-assets@task-and-whole-scene-v1`](https://huggingface.co/datasets/Zhiyuan17/libero40-trqc-assets/tree/task-and-whole-scene-v1) (`cb1c086c7928556af7c2d08ee99f226102c67692`) | Private; HF login required |
+| Supplemental policy data, masks, Semantic boundaries, and task-relevant Geometry/Motion targets | [`official_completion_1932_v1`](https://huggingface.co/datasets/Zhiyuan17/libero40-trqc-assets/tree/official-completion-1932-v1/official_completion_1932_v1) (`476ed61df46b58aa14b363e4be20b6152581791f`) | Private; HF login required |
+| Trained checkpoints and evaluation JSON | [`Zhiyuan17/libero40-trqc-checkpoints`](https://huggingface.co/Zhiyuan17/libero40-trqc-checkpoints) | Public |
+
+The adopted 97.85% checkpoint uses only the first 115 additions in the
+supplemental archive: episode indices `1693..1807`, producing the 1,808-episode
+population. The immutable `official-completion-1932-v1` bundle is a superset:
+it also contains 124 later additions used by the separate complete-1,932-data
+continuation. Its `annotation_audit/completion_delta_115` directory preserves
+the exact selected masks and Semantic boundaries, while the first 115 dataset
+delta parquets and corresponding rows in the combined Geometry/Motion targets
+preserve the training inputs. Do not include all 239 additions when reproducing
+the adopted supplemental-115 result.
+
 ## Required HPC environment
 
 - Linux x86_64 with Git and `curl`
@@ -80,7 +103,7 @@ for task-level counts.
 - 64 CPU cores per training job and persistent scratch storage
 - An NVIDIA driver compatible with the CUDA runtime resolved by the lockfile
 - Access to the private Hugging Face dataset
-  `Zhiyuan17/libero40-trqc-assets`
+  [`Zhiyuan17/libero40-trqc-assets`](https://huggingface.co/datasets/Zhiyuan17/libero40-trqc-assets)
 
 The repository lockfile installs Python 3.11, PyTorch 2.7.1, and Transformers
 4.53.2. Do not create a different environment by hand.
@@ -114,7 +137,8 @@ There are two independent downloads.
 
 ### Public LeRobot data
 
-The downloader pins `physical-intelligence/libero` to revision
+The downloader pins [`physical-intelligence/libero`](https://huggingface.co/datasets/physical-intelligence/libero)
+to revision
 `a4336d589d589045d1c56423ffdf3b88a0e19b1f` and rejects an incomplete or
 different 1,693-episode snapshot.
 
