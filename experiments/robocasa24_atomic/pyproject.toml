@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "robocasa24-finetune"
+version = "0.1.0"
+description = "Isolated RoboCasa Atomic-24 pi0.5 fine-tuning overlays"
+requires-python = ">=3.11"
+dependencies = [
+  "einops",
+  "h5py",
+  "numpy",
+  "pandas",
+  "pyarrow",
+  "safetensors",
+  "torch",
+]
+
+[project.scripts]
+robocasa24-compute-norm-stats = "robocasa24_finetune.compute_norm_stats:main"
+robocasa24-prepare-artifacts = "robocasa24_finetune.prepare_artifacts:main"
+robocasa24-train = "robocasa24_finetune.train:main"
+robocasa24-validate = "robocasa24_finetune.validate:main"
+robocasa24-eval-worker = "robocasa24_finetune.eval_worker:main"
+robocasa24-summarize-eval = "robocasa24_finetune.summarize_eval:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src", "../../src"]
