@@ -129,8 +129,8 @@ export PI05_FP32_BASE="$MODEL_BUNDLE_ROOT/models/pi05_base_pytorch_fp32"
 The Whole-scene cache is the only large research input not currently available
 from HF. Until a pinned repository/revision is published, place its 24 task
 directories under `$WHOLE_CACHE_ROOT`. It must contain validated
-`geometry/final` and `motion/final` outputs aligned to the same valid rows as
-the task-relevant cache. Generate it using
+`geometry_whole_scene/final` and `motion_whole_scene/final` outputs aligned to
+the same valid rows as the task-relevant cache. Generate it using
 [`robocasa-atomic24-cache-tools`](https://github.com/zhiyuan-gao/robocasa-atomic24-cache-tools)
 and its `WHOLE_SCENE_CACHE.md`; do not synthesize or substitute targets on the
 training machine.

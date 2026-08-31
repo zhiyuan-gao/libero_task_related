@@ -22,12 +22,21 @@ def _mkdir(path: Path) -> Path:
     return path
 
 
-def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("scope", "geometry_subdir", "motion_subdir"),
+    [
+        ("task_relevant", "geometry", "motion"),
+        ("whole_scene", "geometry_whole_scene", "motion_whole_scene"),
+    ],
+)
+def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(
+    tmp_path: Path,
+    scope: str,
+    geometry_subdir: str,
+    motion_subdir: str,
+) -> None:
     task = TASKS[0]
-    roots = {
-        name: _mkdir(tmp_path / name)
-        for name in ("manifest", "semantic", "geometry", "motion")
-    }
+    roots = {name: _mkdir(tmp_path / name) for name in ("manifest", "semantic", "geometry", "motion")}
     sample_ids = [f"{task}/base50__demo_0/frame_{i:06d}" for i in range(3)]
     source = pd.DataFrame(
         {
@@ -65,7 +74,7 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
         review=np.zeros(3, dtype=bool),
     )
 
-    geometry_final = _mkdir(roots["geometry"] / task / "geometry/final")
+    geometry_final = _mkdir(roots["geometry"] / task / geometry_subdir / "final")
     geometry_shard = _mkdir(geometry_final / "shards") / "geometry.npz"
     geometry_values = np.stack(
         [
@@ -78,9 +87,7 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
         sample_id=np.asarray([sample_ids[0], sample_ids[2]]),
         geometry_target_fp32=geometry_values,
     )
-    stale_geometry_path = (
-        f"/relocated/machine/{task}/geometry/final/shards/geometry.npz"
-    )
+    stale_geometry_path = f"/relocated/machine/{task}/{geometry_subdir}/final/shards/geometry.npz"
     pd.DataFrame(
         {
             "sample_id": [sample_ids[0], sample_ids[2]],
@@ -93,7 +100,7 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
         }
     ).to_parquet(geometry_final / "index.parquet", index=False)
 
-    motion_final = _mkdir(roots["motion"] / task / "motion/final")
+    motion_final = _mkdir(roots["motion"] / task / motion_subdir / "final")
     motion_shard = _mkdir(motion_final / "shards") / "motion.npz"
     motion_values = np.stack(
         [
@@ -106,7 +113,7 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
         sample_id=np.asarray([sample_ids[0], sample_ids[2]]),
         motion_target_fp32=motion_values,
     )
-    stale_motion_path = f"/relocated/machine/{task}/motion/final/shards/motion.npz"
+    stale_motion_path = f"/relocated/machine/{task}/{motion_subdir}/final/shards/motion.npz"
     pd.DataFrame(
         {
             "sample_id": [sample_ids[0], sample_ids[2]],
@@ -120,7 +127,7 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
 
     output = tmp_path / "prepared"
     report = prepare(
-        scope="task_relevant",
+        scope=scope,
         manifest_root=roots["manifest"],
         semantic_root=roots["semantic"],
         geometry_root=roots["geometry"],
@@ -135,23 +142,18 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
     assert report["semantic_cache_review_true_count"] == 0
     assert report["source_review_accepted_count"] == 3
     store = PreparedAuxiliaryStore(output, tuple(sample_ids))
-    np.testing.assert_array_equal(
-        store.item(1)["geometry"], np.zeros(GEOMETRY_DIM, dtype=np.float32)
-    )
-    np.testing.assert_array_equal(
-        store.item(1)["motion"], np.zeros(MOTION_DIM, dtype=np.float32)
-    )
+    np.testing.assert_array_equal(store.item(1)["geometry"], np.zeros(GEOMETRY_DIM, dtype=np.float32))
+    np.testing.assert_array_equal(store.item(1)["motion"], np.zeros(MOTION_DIM, dtype=np.float32))
     assert not bool(store.item(1)["geometry_valid"])
     assert not bool(store.item(1)["motion_valid"])
-    require_prepared_target_scope(PreparedAuxiliaryPaths(output), "task_relevant")
+    require_prepared_target_scope(PreparedAuxiliaryPaths(output), scope)
+    wrong_scope = "whole_scene" if scope == "task_relevant" else "task_relevant"
     with pytest.raises(ValueError, match="target scope differs"):
-        require_prepared_target_scope(PreparedAuxiliaryPaths(output), "whole_scene")
-    assert (
-        json.loads((output / "geometry_normalization.json").read_text())["count"] == 2
-    )
-    aux = _aux_config("task_relevant", output)
+        require_prepared_target_scope(PreparedAuxiliaryPaths(output), wrong_scope)
+    assert json.loads((output / "geometry_normalization.json").read_text())["count"] == 2
+    aux = _aux_config(scope, output)
     assert aux is not None
-    assert aux.target_scope == "task_relevant"
+    assert aux.target_scope == scope
     assert aux.motion_target_count == 2
     assert (aux.lambda_geo, aux.lambda_sem, aux.lambda_motion) == (0.05, 0.01, 0.05)
 
@@ -179,9 +181,7 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
         def __getitem__(self, index):
             return self._dataset[index]
 
-    joined = RoboCasaPolicyAuxTransformedDataset(
-        UpstreamTransformWrapper(Source()), aux
-    )
+    joined = RoboCasaPolicyAuxTransformedDataset(UpstreamTransformWrapper(Source()), aux)
     assert joined[1]["policy_aux"]["geometry"].shape == (GEOMETRY_DIM,)
 
     subset_sample_ids = (sample_ids[2], sample_ids[0])
@@ -201,12 +201,8 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
             return int(index)
 
     subset = RoboCasaPolicyAuxTransformedDataset(SubsetSource(), aux)
-    np.testing.assert_array_equal(
-        subset[0]["policy_aux"]["geometry"], geometry_values[1]
-    )
-    np.testing.assert_array_equal(
-        subset[1]["policy_aux"]["motion"], motion_values[0]
-    )
+    np.testing.assert_array_equal(subset[0]["policy_aux"]["geometry"], geometry_values[1])
+    np.testing.assert_array_equal(subset[1]["policy_aux"]["motion"], motion_values[0])
 
     class RemappedSource:
         sample_ids = expected_ids
@@ -223,9 +219,5 @@ def test_prepare_aligns_sparse_targets_and_zeroes_invalid_rows(tmp_path: Path) -
 
     remapped = RoboCasaPolicyAuxTransformedDataset(RemappedSource(), aux)
     assert int(remapped[0]["raw_row"]) == 2
-    np.testing.assert_array_equal(
-        remapped[0]["policy_aux"]["geometry"], geometry_values[1]
-    )
-    np.testing.assert_array_equal(
-        remapped[1]["policy_aux"]["motion"], motion_values[0]
-    )
+    np.testing.assert_array_equal(remapped[0]["policy_aux"]["geometry"], geometry_values[1])
+    np.testing.assert_array_equal(remapped[1]["policy_aux"]["motion"], motion_values[0])
