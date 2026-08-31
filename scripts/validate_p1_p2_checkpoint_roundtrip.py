@@ -46,6 +46,7 @@ def main() -> None:
         snapshot=args.snapshot,
         mapping_path=args.mapping,
         annotation_manifest=args.policy_manifest,
+        include_ground_masks=False,
     )
     observation = move_observation(observation, device)
     config = pi0_config.Pi0Config(
@@ -55,11 +56,12 @@ def main() -> None:
         pytorch_compile_mode=None,
     )
     reports = {}
-    for mode in ("geometry", "ground_geometry_semantic_lm"):
+    for mode in ("geometry", "semantic_geometry", "ground_geometry_semantic_lm"):
         aux_config = PolicyAuxConfig(
             mode=mode,
+            num_ground_queries=0 if mode == "semantic_geometry" else 8,
             lambda_geo=0.0,
-            lambda_sem=0.0 if mode == "ground_geometry_semantic_lm" else None,
+            lambda_sem=0.0 if mode in ("semantic_geometry", "ground_geometry_semantic_lm") else None,
             lambda_ground=0.0 if mode == "ground_geometry_semantic_lm" else None,
             geometry_normalization_path=str(args.geometry_normalization),
         )

@@ -5,8 +5,10 @@ from types import SimpleNamespace
 import torch
 
 from openpi.models_pytorch import preprocessing_pytorch
+from openpi.models_pytorch.auxiliary_heads import grounding_fixed_balanced_binary_bce_loss
 from openpi.models_pytorch.auxiliary_heads import grounding_focal_dice_loss
 from openpi.models_pytorch.auxiliary_heads import masked_standardized_mse
+from openpi.models_pytorch.auxiliary_heads import masked_standardized_smooth_l1
 from openpi.models_pytorch.pi05_aux_queries import JointP2TrainLayout
 from openpi.models_pytorch.pi05_aux_queries import PrefixLayout
 from openpi.models_pytorch.pi05_aux_queries import TokenSpan
@@ -27,14 +29,34 @@ def _train_config(mode: str | None):
     if mode is not None:
         policy_aux = SimpleNamespace(
             mode=mode,
-            num_ground_queries=8,
+            num_ground_queries=0 if mode in ("semantic_geometry", "semantic_geometry_motion") else 8,
             num_geometry_queries=8,
+            num_motion_queries=8
+            if mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
+            else 0,
             ground_mask_dim=256,
             ground_focal_alpha=0.25,
             ground_focal_gamma=2.0,
             lambda_geo=0.15,
-            lambda_ground=0.50 if mode == "ground_geometry_semantic_lm" else None,
-            lambda_sem=0.01 if mode == "ground_geometry_semantic_lm" else None,
+            lambda_ground=0.05
+            if mode == "semantic_geometry_motion_binary_ground"
+            else (0.50 if mode == "ground_geometry_semantic_lm" else None),
+            lambda_sem=0.01
+            if mode
+            in (
+                "semantic_geometry",
+                "semantic_geometry_motion",
+                "ground_geometry_semantic_lm",
+                "semantic_geometry_motion_binary_ground",
+            )
+            else None,
+            lambda_motion=0.05
+            if mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
+            else None,
+            ground_objective="binary_fixed_balanced_bce"
+            if mode == "semantic_geometry_motion_binary_ground"
+            else "coverage_focal_dice",
+            ground_positive_weight=5.9399674343 if mode == "semantic_geometry_motion_binary_ground" else None,
             policy_manifest_path="/unusable/semantic-and-grounding",
             geometry_target_index_path="/unusable/geometry",
         )
@@ -56,14 +78,24 @@ def test_shared_factory_selects_plain_or_aux_and_drops_teacher_paths(monkeypatch
 
     plain = create_pytorch_model(_train_config(None))
     p1 = create_pytorch_model(_train_config("geometry"))
+    semantic_geometry = create_pytorch_model(_train_config("semantic_geometry"))
+    semantic_geometry_motion = create_pytorch_model(_train_config("semantic_geometry_motion"))
     p2 = create_pytorch_model(_train_config("ground_geometry_semantic_lm"))
+    p3 = create_pytorch_model(_train_config("semantic_geometry_motion_binary_ground"))
 
     assert type(plain) is FakePlain
     assert type(p1) is FakeAux
     assert type(p2) is FakeAux
     assert p1.aux_config.mode == "geometry"
+    assert semantic_geometry.aux_config.mode == "semantic_geometry"
+    assert semantic_geometry.aux_config.num_ground_queries == 0
+    assert semantic_geometry_motion.aux_config.mode == "semantic_geometry_motion"
+    assert semantic_geometry_motion.aux_config.num_motion_queries == 8
     assert p2.aux_config.mode == "ground_geometry_semantic_lm"
-    for model in (p1, p2):
+    assert p3.aux_config.mode == "semantic_geometry_motion_binary_ground"
+    assert p3.aux_config.ground_objective == "binary_fixed_balanced_bce"
+    assert p3.aux_config.ground_positive_weight == 5.9399674343
+    for model in (p1, semantic_geometry, semantic_geometry_motion, p2, p3):
         assert model.aux_config.semantic_annotation_root is None
         assert model.aux_config.ground_mask_root is None
         assert model.aux_config.geometry_cache_root is None
@@ -99,6 +131,124 @@ def _p2_layout() -> PrefixLayout:
         geometry=TokenSpan(6, 8),
         ground=TokenSpan(8, 10),
     )
+
+
+def test_semantic_geometry_layout_has_geometry_and_no_ground() -> None:
+    layout = PrefixLayout(
+        view_spans={"agent": TokenSpan(0, 2), "wrist": TokenSpan(2, 4)},
+        real_view_names=("agent", "wrist"),
+        padded_view_names=(),
+        language=TokenSpan(4, 6),
+        context=TokenSpan(0, 6),
+        geometry=TokenSpan(6, 14),
+        ground=None,
+        action_suffix=TokenSpan(14, 17),
+    )
+    prefix_pad = torch.ones((1, 14), dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    suffix_ar = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    mask = build_explicit_aux_train_attention(prefix_pad, suffix_pad, suffix_ar, layout)[0]
+
+    assert layout.query_groups == {"geometry": TokenSpan(6, 14)}
+    assert layout.ground is None
+    assert bool(mask[14:, 6:14].all()) is True
+    assert bool(mask[6:14, 14:].any()) is False
+
+
+def test_b_motion_queries_are_isolated_and_visible_to_action() -> None:
+    layout = PrefixLayout(
+        view_spans={"agent": TokenSpan(0, 2)},
+        real_view_names=("agent",),
+        padded_view_names=(),
+        language=TokenSpan(2, 4),
+        context=TokenSpan(0, 4),
+        geometry=TokenSpan(4, 12),
+        ground=None,
+        motion=TokenSpan(12, 20),
+        action_suffix=TokenSpan(20, 23),
+    )
+    prefix_pad = torch.ones((1, 20), dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    suffix_ar = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    mask = build_explicit_aux_train_attention(prefix_pad, suffix_pad, suffix_ar, layout)[0]
+    assert layout.query_groups == {
+        "geometry": TokenSpan(4, 12),
+        "motion": TokenSpan(12, 20),
+    }
+    assert not bool(mask[4:12, 12:20].any())
+    assert not bool(mask[12:20, 4:12].any())
+    assert bool(mask[20:, :20].all())
+
+
+def test_b_joint_mask_hides_semantic_teacher_from_motion_and_action() -> None:
+    base_layout = PrefixLayout(
+        view_spans={"agent": TokenSpan(0, 2)},
+        real_view_names=("agent",),
+        padded_view_names=(),
+        language=TokenSpan(2, 4),
+        context=TokenSpan(0, 4),
+        geometry=TokenSpan(4, 6),
+        ground=None,
+        motion=TokenSpan(6, 8),
+    )
+    layout = JointP2TrainLayout(
+        base_layout=base_layout,
+        semantic=TokenSpan(8, 11),
+        action_suffix=TokenSpan(11, 14),
+    )
+    prefix_pad = torch.ones((1, 11), dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    suffix_ar = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    mask = build_joint_p2_attention(prefix_pad, suffix_pad, suffix_ar, layout)[0]
+
+    # Geometry and Motion each read only Context plus their own query group.
+    assert bool(mask[4:6, :4].all())
+    assert bool(mask[4:6, 4:6].all())
+    assert not bool(mask[4:6, 6:11].any())
+    assert bool(mask[6:8, :4].all())
+    assert bool(mask[6:8, 6:8].all())
+    assert not bool(mask[6:8, 4:6].any())
+    assert not bool(mask[6:8, 8:11].any())
+
+    # Semantic sees Context and its causal teacher prefix, never either query group.
+    assert bool(mask[8:11, :4].all())
+    assert not bool(mask[8:11, 4:8].any())
+
+    # Action reads Context, Geometry, and Motion, but never SemanticTeacher.
+    assert bool(mask[11:14, :8].all())
+    assert not bool(mask[11:14, 8:11].any())
+
+
+def test_motion_smooth_l1_masks_invalid_samples_exactly() -> None:
+    prediction = torch.tensor([[2.0, 0.0], [100.0, -100.0]], requires_grad=True)
+    target = torch.zeros_like(prediction)
+    loss = masked_standardized_smooth_l1(prediction, target, torch.tensor([True, False]), torch.zeros(2), torch.ones(2))
+    assert torch.isclose(loss, torch.tensor(0.75))
+    loss.backward()
+    assert torch.equal(prediction.grad[1], torch.zeros(2))
+
+
+def test_p3_fixed_balanced_binary_bce_uses_overlap_target_and_full_patch_weight() -> None:
+    logits = torch.tensor([[[0.2, -0.4, 1.0], [20.0, 20.0, 20.0]]], requires_grad=True)
+    coverage = torch.tensor([[[0.0, 0.01, 1.0], [0.0, 0.5, 1.0]]])
+    valid = torch.tensor([[True, False]])
+    weight = 5.9399674343
+    result = grounding_fixed_balanced_binary_bce_loss(
+        logits,
+        coverage,
+        valid,
+        positive_weight=weight,
+        distributed_global_reduction=False,
+    )
+
+    binary = torch.tensor([0.0, 1.0, 1.0])
+    per_patch = torch.nn.functional.binary_cross_entropy_with_logits(logits[0, 0], binary, reduction="none")
+    expected = (per_patch[0] + weight * per_patch[1:].sum()) / (1.0 + 2.0 * weight)
+    assert torch.allclose(result["loss"], expected)
+    assert torch.equal(result["binary_target"], coverage > 0)
+    assert torch.isclose(result["fixed_positive_weight"], torch.tensor(weight))
+    result["loss"].backward()
+    assert torch.equal(logits.grad[0, 1], torch.zeros(3))
 
 
 def test_explicit_p2_attention_rectangles() -> None:
@@ -202,6 +352,40 @@ def test_joint_p2_attention_has_exact_branch_connectivity_and_padding() -> None:
     for padded_index in (5, 12):
         assert bool(mask[padded_index].any()) is False
         assert bool(mask[:, padded_index].any()) is False
+
+
+def test_semantic_geometry_uses_p2_joint_mask_without_ground() -> None:
+    base_layout = PrefixLayout(
+        view_spans={"agent": TokenSpan(0, 2), "wrist": TokenSpan(2, 4)},
+        real_view_names=("agent", "wrist"),
+        padded_view_names=(),
+        language=TokenSpan(4, 6),
+        context=TokenSpan(0, 6),
+        geometry=TokenSpan(6, 8),
+        ground=None,
+    )
+    layout = JointP2TrainLayout(
+        base_layout=base_layout,
+        semantic=TokenSpan(8, 11),
+        action_suffix=TokenSpan(11, 14),
+    )
+    paligemma_pad = torch.ones((1, 11), dtype=torch.bool)
+    suffix_pad = torch.ones((1, 3), dtype=torch.bool)
+    suffix_ar = torch.tensor([[1, 0, 0]], dtype=torch.bool)
+    mask = build_joint_p2_attention(paligemma_pad, suffix_pad, suffix_ar, layout)[0]
+
+    # Geometry follows the P2 isolated-query rule and Semantic reads only
+    # Context plus its causal teacher prefix.
+    assert bool(mask[6:8, :6].all()) is True
+    assert bool(mask[6:8, 6:8].all()) is True
+    assert bool(mask[6:8, 8:].any()) is False
+    assert bool(mask[8:11, :6].all()) is True
+    assert bool(mask[8:11, 6:8].any()) is False
+
+    # The Action suffix reads Context and Geometry exactly as P2 does after
+    # deleting Ground, while Semantic teacher tokens remain structurally hidden.
+    assert bool(mask[11:14, :8].all()) is True
+    assert bool(mask[11:14, 8:11].any()) is False
 
 
 def test_joint_p2_positions_match_old_main_and_semantic_references() -> None:

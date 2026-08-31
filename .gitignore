@@ -3,6 +3,8 @@ assets/
 checkpoints/
 data/
 wandb/
+# Machine-local LIBERO path configuration.
+.libero/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

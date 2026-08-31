@@ -22,7 +22,13 @@ class SemanticTeacherTensors:
     loss_mask: np.ndarray
 
 
-PolicyAuxMode = Literal["geometry", "ground_geometry_semantic_lm"]
+PolicyAuxMode = Literal[
+    "geometry",
+    "semantic_geometry",
+    "semantic_geometry_motion",
+    "ground_geometry_semantic_lm",
+    "semantic_geometry_motion_binary_ground",
+]
 
 CANONICAL_LIBERO_REVISION = "a4336d589d589045d1c56423ffdf3b88a0e19b1f"
 CANONICAL_LIBERO_EPISODES = 379
@@ -30,6 +36,10 @@ CANONICAL_LIBERO_FRAMES = 101_469
 LIBERO3_PILOT_TASK_INDICES = (0, 3, 8)
 LIBERO3_PILOT_EPISODES = 114
 LIBERO3_PILOT_FRAMES = 29_250
+LIBERO3_BINARY_GROUND_POSITIVE_PATCHES = 2_094_230
+LIBERO3_BINARY_GROUND_NEGATIVE_PATCHES = 12_439_658
+LIBERO3_BINARY_GROUND_POSITIVE_WEIGHT = 5.9399674343
+LIBERO3_MOTION_VALID_FRAMES = 28_110
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,15 +51,24 @@ class PolicyAuxTrainConfig:
     episode_mapping_path: str
     geometry_target_index_path: str
     geometry_normalization_path: str
+    motion_target_index_path: str | None = None
+    motion_normalization_path: str | None = None
+    # Freeze the valid Motion population for the selected training dataset.
+    # ``None`` preserves compatibility with the original three-task recipe.
+    motion_target_count: int | None = None
     lambda_geo: float | None = None
     lambda_sem: float | None = None
     lambda_ground: float | None = None
+    lambda_motion: float | None = None
     semantic_max_target_len: int = 32
     num_ground_queries: int = 8
     num_geometry_queries: int = 8
+    num_motion_queries: int = 0
     ground_mask_dim: int = 256
     ground_focal_alpha: float = 0.25
     ground_focal_gamma: float = 2.0
+    ground_objective: Literal["coverage_focal_dice", "binary_fixed_balanced_bce"] = "coverage_focal_dice"
+    ground_positive_weight: float | None = None
     lerobot_revision: str = CANONICAL_LIBERO_REVISION
     lerobot_root: str | None = None
     lerobot_task_indices: tuple[int, ...] | None = None
@@ -59,23 +78,67 @@ class PolicyAuxTrainConfig:
     diagnostic_skip_semantic_lm: bool = False
 
     def __post_init__(self) -> None:
-        if self.mode not in ("geometry", "ground_geometry_semantic_lm"):
+        if self.mode not in (
+            "geometry",
+            "semantic_geometry",
+            "semantic_geometry_motion",
+            "ground_geometry_semantic_lm",
+            "semantic_geometry_motion_binary_ground",
+        ):
             raise ValueError(f"Unsupported policy auxiliary training mode: {self.mode}")
         if self.diagnostic_skip_semantic_lm and self.mode != "ground_geometry_semantic_lm":
             raise ValueError("The semantic-LM ablation requires the complete P2 mode")
         required_lambdas = ["lambda_geo"]
-        if self.mode == "ground_geometry_semantic_lm":
-            required_lambdas.extend(("lambda_sem", "lambda_ground"))
+        if self.mode in (
+            "semantic_geometry",
+            "semantic_geometry_motion",
+            "ground_geometry_semantic_lm",
+            "semantic_geometry_motion_binary_ground",
+        ):
+            required_lambdas.append("lambda_sem")
+        if self.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground"):
+            required_lambdas.append("lambda_motion")
+        if self.mode in ("ground_geometry_semantic_lm", "semantic_geometry_motion_binary_ground"):
+            required_lambdas.append("lambda_ground")
         if self.loss_coefficients_approved and any(getattr(self, name) is None for name in required_lambdas):
             raise ValueError(f"Approved P1/P2 config is missing a required loss coefficient: {required_lambdas}")
         if self.loss_coefficients_approved and any(getattr(self, name) <= 0 for name in required_lambdas):
             raise ValueError("Approved P1/P2 loss coefficients must be strictly positive")
-        for name in ("lambda_geo", "lambda_sem", "lambda_ground"):
+        for name in ("lambda_geo", "lambda_sem", "lambda_ground", "lambda_motion"):
             value = getattr(self, name)
             if value is not None and value < 0:
                 raise ValueError(f"{name} must be non-negative")
-        if self.num_ground_queries != 8 or self.num_geometry_queries != 8:
-            raise ValueError("P1/P2 v0 query counts are frozen at eight")
+        if self.num_geometry_queries != 8:
+            raise ValueError("Policy auxiliary Geometry query count is frozen at eight")
+        # Preserve the frozen legacy P1/P2 config schema while making the new
+        # Semantic+Geometry experiment explicitly Ground-free.
+        expected_ground_queries = 0 if self.mode in ("semantic_geometry", "semantic_geometry_motion") else 8
+        if self.num_ground_queries != expected_ground_queries:
+            raise ValueError(
+                f"{self.mode} requires num_ground_queries={expected_ground_queries}, found {self.num_ground_queries}"
+            )
+        expected_motion_queries = (
+            8 if self.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground") else 0
+        )
+        if self.num_motion_queries != expected_motion_queries:
+            raise ValueError(
+                f"{self.mode} requires num_motion_queries={expected_motion_queries}, found {self.num_motion_queries}"
+            )
+        if self.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground") and (
+            self.motion_target_index_path is None or self.motion_normalization_path is None
+        ):
+            raise ValueError("B requires Motion target index and train normalization paths")
+        if self.motion_target_count is not None and self.motion_target_count <= 0:
+            raise ValueError("motion_target_count must be positive when set")
+        if self.mode == "semantic_geometry_motion_binary_ground":
+            if self.ground_objective != "binary_fixed_balanced_bce":
+                raise ValueError("P3 requires binary_fixed_balanced_bce Ground objective")
+            if self.ground_positive_weight is None or not np.isfinite(self.ground_positive_weight):
+                raise ValueError("P3 requires a finite dataset-global fixed Ground positive weight")
+            if self.ground_positive_weight <= 0:
+                raise ValueError("P3 Ground positive weight must be strictly positive")
+        elif self.ground_objective != "coverage_focal_dice" or self.ground_positive_weight is not None:
+            raise ValueError("Only P3 may use the fixed-balanced binary Ground objective/weight")
         if self.lerobot_revision != CANONICAL_LIBERO_REVISION:
             raise ValueError(
                 f"P1/P2 policy training is frozen to official LeRobot revision {CANONICAL_LIBERO_REVISION}"
@@ -84,7 +147,7 @@ class PolicyAuxTrainConfig:
             raise ValueError("LeRobot snapshot directory does not match the frozen revision")
         if self.lerobot_task_indices is not None and tuple(self.lerobot_task_indices) != LIBERO3_PILOT_TASK_INDICES:
             raise ValueError(
-                "The only approved reduced pilot population is LeRobot task indices " f"{LIBERO3_PILOT_TASK_INDICES}"
+                f"The only approved reduced pilot population is LeRobot task indices {LIBERO3_PILOT_TASK_INDICES}"
             )
 
     def _validated_mapping_records(self) -> list[dict]:
@@ -340,6 +403,69 @@ class GeometryPolicyTargetIndex:
         return target, True, str(row["sample_id"])
 
 
+class MotionPolicyTargetIndex:
+    """Read an immutable Motion shard cache by stable sample ID."""
+
+    def __init__(
+        self,
+        target_index_path: str | Path,
+        normalization_path: str | Path,
+        expected_count: int = LIBERO3_MOTION_VALID_FRAMES,
+    ) -> None:
+        if expected_count <= 0:
+            raise ValueError("Motion expected_count must be positive")
+        self.target_index_path = Path(target_index_path).resolve(strict=True)
+        self.normalization_path = Path(normalization_path).resolve(strict=True)
+        frame = pd.read_parquet(self.target_index_path)
+        required_columns = {"sample_id", "target_shard_path", "target_shard_row", "target_dim", "target_dtype"}
+        if not required_columns.issubset(frame.columns):
+            raise ValueError("Motion target index is missing required columns")
+        if len(frame) != expected_count or not frame["sample_id"].is_unique:
+            raise ValueError(f"Motion target index must cover {expected_count} unique valid samples")
+        if not frame["target_dim"].eq(256).all() or not frame["target_dtype"].eq("float32").all():
+            raise ValueError("Motion targets must all be float32[256]")
+        self._rows = frame.set_index("sample_id", verify_integrity=True)
+
+        normalization = json.loads(self.normalization_path.read_text())
+        if (
+            int(normalization.get("count", -1)) != expected_count
+            or normalization.get("dtype") != "float32"
+            or int(normalization.get("feature_dim", -1)) != 256
+            or normalization.get("finite") is not True
+        ):
+            raise ValueError("Motion train normalization metadata is not the frozen valid population")
+        self.mean = np.asarray(normalization["mean"], dtype=np.float32)
+        self.std = np.asarray(normalization["std"], dtype=np.float32)
+        if self.mean.shape != (256,) or self.std.shape != (256,):
+            raise ValueError("Unexpected Motion normalization shape")
+        if not np.isfinite(self.mean).all() or not np.isfinite(self.std).all() or not (self.std > 0).all():
+            raise ValueError("Motion normalization is non-finite or non-positive")
+
+    @staticmethod
+    # The complete three-task cache is only ~28 MB per worker. Retaining all
+    # 113 small shards avoids random-sampler decompression thrash.
+    @functools.lru_cache(maxsize=128)
+    def _load_shard(path: str) -> dict[str, np.ndarray]:
+        with np.load(path, allow_pickle=False) as arrays:
+            return {name: arrays[name].copy() for name in arrays.files}
+
+    def target_by_sample_id(self, sample_id: str) -> tuple[np.ndarray | None, bool]:
+        if sample_id not in self._rows.index:
+            return None, False
+        row = self._rows.loc[sample_id]
+        shard_path = Path(str(row["target_shard_path"]))
+        if not shard_path.is_absolute():
+            shard_path = self.target_index_path.parent / shard_path
+        shard = self._load_shard(str(shard_path.resolve(strict=True)))
+        shard_row = int(row["target_shard_row"])
+        if str(shard["sample_id"][shard_row]) != sample_id:
+            raise ValueError(f"Motion shard identity mismatch for {sample_id}")
+        target = np.asarray(shard["motion_target_fp32"][shard_row], dtype=np.float32)
+        if target.shape != (256,) or not np.isfinite(target).all():
+            raise ValueError(f"Invalid Motion target for {sample_id}")
+        return target, True
+
+
 class PolicyAuxTargetIndex:
     """Join current-frame semantic, Grounding, and Geometry targets by stable identity."""
 
@@ -347,6 +473,15 @@ class PolicyAuxTargetIndex:
         self.config = config
         self.annotations = Libero10AnnotationIndex(config.policy_manifest_path, config.episode_mapping_path)
         self.geometry = GeometryPolicyTargetIndex(config.geometry_target_index_path, config.geometry_normalization_path)
+        self.motion = (
+            MotionPolicyTargetIndex(
+                config.motion_target_index_path,
+                config.motion_normalization_path,
+                expected_count=config.motion_target_count or LIBERO3_MOTION_VALID_FRAMES,
+            )
+            if config.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
+            else None
+        )
         self.semantic_tokenizer = PolicySemanticTokenizer(config.semantic_max_target_len)
         mapping = json.loads(Path(config.episode_mapping_path).read_text())
         self._dataset_identity = {}
@@ -374,13 +509,34 @@ class PolicyAuxTargetIndex:
             "geometry_mean": self.geometry.mean,
             "geometry_std": self.geometry.std,
         }
-        if self.config.mode == "ground_geometry_semantic_lm":
+        if self.config.mode in ("ground_geometry_semantic_lm", "semantic_geometry_motion_binary_ground"):
             masks, ground_valid = self.annotations.load_upright_ground_masks(row)
-            semantic = self.semantic_tokenizer.fixed(str(row["semantic_subtask"]))
             result.update(
                 {
                     "ground_masks": masks,
                     "ground_valid_views": ground_valid,
+                }
+            )
+        motion_index = getattr(self, "motion", None)
+        if motion_index is not None:
+            motion, motion_valid = motion_index.target_by_sample_id(sample_id)
+            result.update(
+                {
+                    "motion": motion if motion is not None else np.zeros((256,), dtype=np.float32),
+                    "motion_valid": np.asarray(motion_valid, dtype=bool),
+                    "motion_mean": motion_index.mean,
+                    "motion_std": motion_index.std,
+                }
+            )
+        if self.config.mode in (
+            "semantic_geometry",
+            "semantic_geometry_motion",
+            "ground_geometry_semantic_lm",
+            "semantic_geometry_motion_binary_ground",
+        ):
+            semantic = self.semantic_tokenizer.fixed(str(row["semantic_subtask"]))
+            result.update(
+                {
                     "semantic_input_ids": semantic.input_ids,
                     "semantic_labels": semantic.labels,
                     "semantic_loss_mask": semantic.loss_mask,
@@ -405,12 +561,21 @@ class PolicyAuxTransformedDataset:
     def __len__(self) -> int:
         return len(self.dataset)
 
+    def _make_target_index(self) -> PolicyAuxTargetIndex:
+        """Build the target index inside the current DataLoader process.
+
+        Dataset overlays can override this method without relying on process-local
+        monkeypatches, which are not inherited by DataLoader ``spawn`` workers.
+        """
+
+        return PolicyAuxTargetIndex(self.config)
+
     def __getitem__(self, index: int) -> dict:
         if self._target_index is None:
             # Construct lazily inside each spawned DataLoader worker. The large
             # target matrix remains a shared read-only OS memory map rather than
             # being serialized from the parent process.
-            self._target_index = PolicyAuxTargetIndex(self.config)
+            self._target_index = self._make_target_index()
         item = self.dataset[index]
         if "policy_aux" in item:
             raise ValueError("Base transformed dataset unexpectedly contains policy_aux")

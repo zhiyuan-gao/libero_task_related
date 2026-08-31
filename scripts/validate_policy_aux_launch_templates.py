@@ -50,7 +50,7 @@ def main() -> None:
             "canonical_dataset_revision": config.policy_aux.lerobot_root.endswith(
                 "/a4336d589d589045d1c56423ffdf3b88a0e19b1f"
             ),
-            "official_ema_decay": config.ema_decay == 0.999,
+            "project_default_ema_disabled": config.ema_decay is None,
         }
         if variant == "p2":
             checks.update(
@@ -76,7 +76,7 @@ def main() -> None:
         ),
         "same_data_scaled_training_steps": p1.num_train_steps == p2.num_train_steps == 11_132,
         "same_data_scaled_warmup": p1.lr_schedule.warmup_steps == p2.lr_schedule.warmup_steps == 3_710,
-        "same_official_ema_policy": p1.ema_decay == p2.ema_decay == 0.999,
+        "same_project_no_ema_policy": p1.ema_decay is p2.ema_decay is None,
         "same_precision": p1.pytorch_training_precision == p2.pytorch_training_precision,
         "same_seed": p1.seed == p2.seed,
         "same_checkpoint_cadence": (
@@ -95,6 +95,11 @@ def main() -> None:
     common_script = repo / "scripts/policy_aux_gpu_common.sh"
     common_text = common_script.read_text()
     libero3_common_text = (repo / "scripts/policy_aux_libero3_8gpu_common.sh").read_text()
+    official_config = _config.get_config("pi05_libero")
+    libero3_configs = (
+        _config.get_config("pi05_libero3_p1_aux"),
+        _config.get_config("pi05_libero3_p2_aux"),
+    )
     wrapper_checks = {
         "common_script_executable": common_script.stat().st_mode & 0o111 != 0,
         "requires_exact_profile_gpu_count": "Expected exactly ${gpu_profile} visible CUDA devices" in common_text,
@@ -110,7 +115,13 @@ def main() -> None:
         ),
         "frozen_data_scaled_steps": "readonly frozen_num_train_steps=11132" in common_text,
         "frozen_data_scaled_warmup_documented": "readonly frozen_warmup_steps=3710" in common_text,
-        "frozen_official_ema": "readonly frozen_ema_decay=0.999" in common_text,
+        "project_launchers_do_not_override_ema": all(
+            token not in text
+            for text in (common_text, libero3_common_text)
+            for token in ("--ema-decay", "frozen_ema_decay")
+        ),
+        "official_pi05_libero_ema_unchanged": official_config.ema_decay == 0.999,
+        "libero3_project_configs_disable_ema": all(config.ema_decay is None for config in libero3_configs),
         "passes_lambda_approval": "loss-coefficients-approved" in common_text,
         "frozen_lambda_geo": "readonly frozen_lambda_geo=0.15" in common_text,
         "frozen_lambda_ground": "readonly frozen_lambda_ground=0.50" in common_text,

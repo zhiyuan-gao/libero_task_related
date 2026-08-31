@@ -1,0 +1,9 @@
+__pycache__/
+.pytest_cache/
+*.py[cod]
+artifacts/
+checkpoints/
+logs/
+reports/
+videos/
+hpc.env

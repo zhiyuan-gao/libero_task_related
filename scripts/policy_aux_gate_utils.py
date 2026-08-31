@@ -29,6 +29,7 @@ def load_real_libero_item(
     annotation_manifest: Path,
     lerobot_episode_index: int = 0,
     frame_index: int = 0,
+    include_ground_masks: bool = True,
 ) -> tuple[_model.Observation, torch.Tensor, dict, pd.Series]:
     mapping = json.loads(mapping_path.read_text())
     episode = next(row for row in mapping["episodes"] if int(row["lerobot_episode_index"]) == lerobot_episode_index)
@@ -72,18 +73,23 @@ def load_real_libero_item(
 
     annotation_index = Libero10AnnotationIndex(annotation_manifest, mapping_path)
     annotation_row = annotation_index.row(lerobot_episode_index, frame_index)
-    ground_masks, ground_valid = annotation_index.load_upright_ground_masks(annotation_row)
     semantic = PolicySemanticTokenizer().batch([str(annotation_row["semantic_subtask"])])
     auxiliary = {
         "sample_id": str(annotation_row["sample_id"]),
         "prompt": prompt,
         "semantic_text": str(annotation_row["semantic_subtask"]),
-        "ground_masks": {key: torch.from_numpy(value[None]) for key, value in ground_masks.items()},
-        "ground_valid_views": torch.from_numpy(ground_valid[None]),
         "semantic_input_ids": torch.from_numpy(semantic.input_ids),
         "semantic_labels": torch.from_numpy(semantic.labels),
         "semantic_loss_mask": torch.from_numpy(semantic.loss_mask),
     }
+    if include_ground_masks:
+        ground_masks, ground_valid = annotation_index.load_upright_ground_masks(annotation_row)
+        auxiliary.update(
+            {
+                "ground_masks": {key: torch.from_numpy(value[None]) for key, value in ground_masks.items()},
+                "ground_valid_views": torch.from_numpy(ground_valid[None]),
+            }
+        )
     return observation, torch.from_numpy(padded_actions), auxiliary, annotation_row
 
 

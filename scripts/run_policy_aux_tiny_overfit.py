@@ -58,7 +58,11 @@ def resolve_parameter(model: torch.nn.Module, suffix: str) -> torch.nn.Parameter
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("geometry", "ground_geometry_semantic_lm"), required=True)
+    parser.add_argument(
+        "--mode",
+        choices=("geometry", "semantic_geometry", "ground_geometry_semantic_lm"),
+        required=True,
+    )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--lerobot-root", type=Path, required=True)
     parser.add_argument("--libero-assets-root", type=Path, required=True)
@@ -82,14 +86,18 @@ def main() -> None:
         raise RuntimeError("Tiny overfit performs optimizer steps and requires explicit lambda approval")
     if args.lambda_geo <= 0 or args.learning_rate <= 0 or args.updates <= 0:
         raise ValueError("Geometry lambda, learning rate, and update count are invalid")
-    if args.mode == "ground_geometry_semantic_lm" and (args.lambda_sem is None or args.lambda_ground is None):
+    if args.mode in ("semantic_geometry", "ground_geometry_semantic_lm") and args.lambda_sem is None:
+        raise ValueError("Semantic tiny overfit requires lambda-sem")
+    if args.mode == "ground_geometry_semantic_lm" and args.lambda_ground is None:
         raise ValueError("P2 tiny overfit requires lambda-sem and lambda-ground")
     if any(value is not None and value <= 0 for value in (args.lambda_sem, args.lambda_ground)):
         raise ValueError("P2 lambdas must be non-negative")
     expected_lambdas = {
         "lambda_geo": FROZEN_LAMBDA_GEO,
         "lambda_ground": (FROZEN_LAMBDA_GROUND if args.mode == "ground_geometry_semantic_lm" else None),
-        "lambda_sem": (FROZEN_LAMBDA_SEM if args.mode == "ground_geometry_semantic_lm" else None),
+        "lambda_sem": (
+            FROZEN_LAMBDA_SEM if args.mode in ("semantic_geometry", "ground_geometry_semantic_lm") else None
+        ),
     }
     supplied_lambdas = {
         "lambda_geo": args.lambda_geo,
@@ -113,10 +121,20 @@ def main() -> None:
     source_gradient_calibration = json.loads(args.source_gradient_calibration.read_text())
     if source_gradient_calibration.get("status") != "PASS_AWAITING_HUMAN_LAMBDA_APPROVAL":
         raise RuntimeError("Strict-nested fixed-16 gradient calibration is not PASS")
-    selected = [int(value) for value in source_gradient_calibration["dataset_indices"]]
-    if len(selected) != 16 or len(set(selected)) != 16:
-        raise RuntimeError("Source calibration does not contain 16 unique samples")
     manifest = pd.read_parquet(args.policy_manifest).set_index("lerobot_dataset_index")
+    if args.mode == "semantic_geometry":
+        # Deterministic, task-balanced coverage of the exact A population.
+        selected = []
+        for task_index, count in ((0, 6), (3, 5), (8, 5)):
+            candidates = manifest.loc[
+                manifest["lerobot_task_index"].eq(task_index) & manifest["geometry_valid"].astype(bool)
+            ].sort_index()
+            positions = torch.linspace(0, len(candidates) - 1, steps=count).round().to(torch.int64).tolist()
+            selected.extend(int(candidates.index[position]) for position in positions)
+    else:
+        selected = [int(value) for value in source_gradient_calibration["dataset_indices"]]
+    if len(selected) != 16 or len(set(selected)) != 16:
+        raise RuntimeError("Tiny-overfit selection does not contain 16 unique samples")
     selected_rows = manifest.loc[selected]
     required_validity = selected_rows["geometry_valid"].astype(bool)
     if args.mode == "ground_geometry_semantic_lm":
@@ -138,7 +156,9 @@ def main() -> None:
         lambda_geo=args.lambda_geo,
         lambda_sem=args.lambda_sem,
         lambda_ground=args.lambda_ground,
+        num_ground_queries=0 if args.mode == "semantic_geometry" else 8,
         lerobot_root=str(args.lerobot_root.resolve(strict=True)),
+        lerobot_task_indices=(0, 3, 8) if args.mode == "semantic_geometry" else None,
         loss_coefficients_approved=True,
     )
     raw_dataset = _data_loader.create_torch_dataset(
@@ -152,6 +172,7 @@ def main() -> None:
 
     aux_model_config = PolicyAuxConfig(
         mode=args.mode,
+        num_ground_queries=0 if args.mode == "semantic_geometry" else 8,
         lambda_geo=args.lambda_geo,
         lambda_sem=args.lambda_sem,
         lambda_ground=args.lambda_ground,
@@ -162,9 +183,11 @@ def main() -> None:
     model.to(device)
     model.gradient_checkpointing_enable()
 
+    subset_dataset_indices = aux_train_config.lerobot_dataset_indices()
+    full_to_local = {dataset_index: local_index for local_index, dataset_index in enumerate(subset_dataset_indices)}
     cached_batches = []
     for dataset_index in selected:
-        batch = _data_loader._collate_fn([dataset[dataset_index]])  # noqa: SLF001
+        batch = _data_loader._collate_fn([dataset[full_to_local[dataset_index]]])  # noqa: SLF001
         cached_batches.append(jax.tree.map(torch.as_tensor, batch))
 
     def prepared(ordinal: int):
@@ -355,7 +378,11 @@ def main() -> None:
     print(f"{args.mode}: saved trained model to {model_output}", flush=True)
 
     final = evaluate()
-    blocked_groups = frozenset({"geometry"}) if args.mode == "geometry" else frozenset({"geometry", "ground"})
+    blocked_groups = (
+        frozenset({"geometry"})
+        if args.mode in ("geometry", "semantic_geometry")
+        else frozenset({"geometry", "ground"})
+    )
     trained_state_versions = {
         name: parameter._version  # noqa: SLF001
         for name, parameter in tracked_gradient_parameters.items()
@@ -429,7 +456,9 @@ def main() -> None:
         visual_output.parent.mkdir(parents=True, exist_ok=True)
         Image.fromarray(canvas).save(visual_output)
     required_losses = ["loss_geometry"]
-    if args.mode == "ground_geometry_semantic_lm":
+    if args.mode == "semantic_geometry":
+        required_losses.append("loss_semantic")
+    elif args.mode == "ground_geometry_semantic_lm":
         required_losses.extend(("loss_ground", "loss_semantic"))
     all_evaluation_values = (
         *initial.values(),
@@ -472,11 +501,15 @@ def main() -> None:
         "gate": f"pi05_{args.mode}_fixed16_tiny_overfit_v1",
         "scope": "engineering gate only; no policy-quality claim",
         "mode": args.mode,
-        "architecture": (
-            "Context|Geometryx8|Action"
-            if args.mode == "geometry"
-            else "Context|Geometryx8|Groundx8|Action + separate native semantic LM"
-        ),
+        "architecture": {
+            "geometry": "Context|Geometryx8|Action",
+            "semantic_geometry": (
+                "P2 joint-masked Context|Geometryx8|SemanticTeacher + Action suffix, with Ground removed"
+            ),
+            "ground_geometry_semantic_lm": (
+                "Context|Geometryx8|Groundx8|Action + native semantic LM"
+            ),
+        }[args.mode],
         "strict_load": strict_load,
         "source_gradient_calibration": str(args.source_gradient_calibration.resolve(strict=True)),
         "source_gradient_calibration_sha256": sha256_file(args.source_gradient_calibration),

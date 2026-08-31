@@ -21,14 +21,18 @@ import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 from openpi.training.policy_aux_dataset import PolicySemanticTokenizer
 
 
-def semantic_targets(auxiliary: dict, device: torch.device) -> PolicyAuxTargets:
+def semantic_targets(auxiliary: dict, device: torch.device, *, include_ground: bool) -> PolicyAuxTargets:
     return PolicyAuxTargets(
         geometry=torch.zeros((1, 2048), dtype=torch.float32, device=device),
         geometry_valid=torch.ones((1,), dtype=torch.bool, device=device),
         geometry_mean=torch.zeros((2048,), dtype=torch.float32, device=device),
         geometry_std=torch.ones((2048,), dtype=torch.float32, device=device),
-        ground_masks={name: value.to(device) for name, value in auxiliary["ground_masks"].items()},
-        ground_valid_views=auxiliary["ground_valid_views"].to(device),
+        ground_masks=(
+            {name: value.to(device) for name, value in auxiliary["ground_masks"].items()}
+            if include_ground
+            else None
+        ),
+        ground_valid_views=auxiliary["ground_valid_views"].to(device) if include_ground else None,
         semantic_input_ids=auxiliary["semantic_input_ids"].to(device),
         semantic_labels=auxiliary["semantic_labels"].to(device),
         semantic_loss_mask=auxiliary["semantic_loss_mask"].to(device),
@@ -40,13 +44,34 @@ def replacement_semantic_targets(
     replacement_text: str,
     device: torch.device,
 ) -> PolicyAuxTargets:
+    # The production collator dynamically pads SemanticTeacher to the longest
+    # target in each batch.  Select an equal-token-length real target and keep
+    # both the physical sequence and validity mask unchanged, so this changes
+    # teacher token content only (the same isolation test as P2).
     replacement = PolicySemanticTokenizer().batch([replacement_text])
+    replacement_input_ids = torch.from_numpy(replacement.input_ids).to(device)
+    replacement_labels = torch.from_numpy(replacement.labels).to(device)
+    replacement_loss_mask = torch.from_numpy(replacement.loss_mask).to(device)
+    if replacement_input_ids.shape != base.semantic_input_ids.shape:
+        raise RuntimeError("Replacement semantic teacher changed the physical sequence length")
+    if not torch.equal(replacement_loss_mask, base.semantic_loss_mask):
+        raise RuntimeError("Replacement semantic teacher must preserve the validity/loss mask")
     return dataclasses.replace(
         base,
-        semantic_input_ids=torch.from_numpy(replacement.input_ids).to(device),
-        semantic_labels=torch.from_numpy(replacement.labels).to(device),
-        semantic_loss_mask=torch.from_numpy(replacement.loss_mask).to(device),
+        semantic_input_ids=replacement_input_ids,
+        semantic_labels=replacement_labels,
+        semantic_loss_mask=replacement_loss_mask,
     )
+
+
+def select_equal_length_replacement(inventory: dict, original_text: str) -> str:
+    tokenizer = PolicySemanticTokenizer()
+    original_length = len(tokenizer.encode_target(original_text))
+    for row in inventory["targets"]:
+        candidate = row["canonical_original_string"]
+        if candidate != original_text and len(tokenizer.encode_target(candidate)) == original_length:
+            return candidate
+    raise RuntimeError(f"No equal-token-length semantic replacement exists for {original_text!r}")
 
 
 def run_full_forward(
@@ -78,6 +103,11 @@ def main() -> None:
     parser.add_argument("--semantic-inventory", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--mode",
+        choices=("semantic_geometry", "ground_geometry_semantic_lm"),
+        default="ground_geometry_semantic_lm",
+    )
     args = parser.parse_args()
     started = time.monotonic()
     device = torch.device(args.device)
@@ -86,13 +116,10 @@ def main() -> None:
         snapshot=args.snapshot,
         mapping_path=args.mapping,
         annotation_manifest=args.annotation_manifest,
+        include_ground_masks=args.mode == "ground_geometry_semantic_lm",
     )
     inventory = json.loads(args.semantic_inventory.read_text())
-    replacement_text = next(
-        row["canonical_original_string"]
-        for row in inventory["targets"]
-        if row["canonical_original_string"] != auxiliary["semantic_text"]
-    )
+    replacement_text = select_equal_length_replacement(inventory, auxiliary["semantic_text"])
     observation = move_observation(observation, device)
     actions = actions.to(device)
     config = pi0_config.Pi0Config(
@@ -102,20 +129,27 @@ def main() -> None:
         pytorch_compile_mode=None,
     )
     aux_config = PolicyAuxConfig(
-        mode="ground_geometry_semantic_lm",
+        mode=args.mode,
+        num_ground_queries=0 if args.mode == "semantic_geometry" else 8,
         lambda_sem=1.0,
-        lambda_ground=1.0,
+        lambda_ground=1.0 if args.mode == "ground_geometry_semantic_lm" else None,
         lambda_geo=1.0,
     )
     model = PI05AuxPolicy(config, aux_config)
     strict_load = model.load_official_base_checkpoint(str(args.checkpoint), device="cpu")
     model.to(device).eval()
-    targets = semantic_targets(auxiliary, device)
-    replacement_targets = replacement_semantic_targets(targets, replacement_text, device)
-    changed_ground_targets = dataclasses.replace(
-        targets,
-        ground_masks={name: torch.zeros_like(mask) for name, mask in targets.ground_masks.items()},
+    targets = semantic_targets(
+        auxiliary,
+        device,
+        include_ground=args.mode == "ground_geometry_semantic_lm",
     )
+    replacement_targets = replacement_semantic_targets(targets, replacement_text, device)
+    changed_ground_targets = None
+    if args.mode == "ground_geometry_semantic_lm":
+        changed_ground_targets = dataclasses.replace(
+            targets,
+            ground_masks={name: torch.zeros_like(mask) for name, mask in targets.ground_masks.items()},
+        )
     changed_geometry_targets = dataclasses.replace(
         targets,
         geometry=torch.full_like(targets.geometry, 17.0),
@@ -128,7 +162,11 @@ def main() -> None:
     first = run_full_forward(model, observation, actions, targets, noise, diffusion_time)
     second = run_full_forward(model, observation, actions, targets, noise, diffusion_time)
     changed_target = run_full_forward(model, observation, actions, replacement_targets, noise, diffusion_time)
-    changed_ground = run_full_forward(model, observation, actions, changed_ground_targets, noise, diffusion_time)
+    changed_ground = (
+        run_full_forward(model, observation, actions, changed_ground_targets, noise, diffusion_time)
+        if changed_ground_targets is not None
+        else None
+    )
     changed_geometry = run_full_forward(model, observation, actions, changed_geometry_targets, noise, diffusion_time)
     first_action = first["action_loss_per_element"]
     second_action = second["action_loss_per_element"]
@@ -137,6 +175,7 @@ def main() -> None:
     second_semantic = second["losses"]["semantic"]
     changed_semantic = changed_target["losses"]["semantic"]
     layout = first["layout"]
+    joint_train_layout = first.get("joint_train_layout")
 
     # Run the semantic pass alone so its gradient provenance cannot include the
     # action expert or either auxiliary query group.
@@ -194,14 +233,22 @@ def main() -> None:
         "official_pi05_libero_semantics": (
             config.pi05 is True and config.action_horizon == 10 and config.discrete_state_input is False
         ),
-        "primary_p2_has_no_semantic_query_parameter": not hasattr(model, "semantic_queries"),
-        "primary_p2_layout_has_only_ground_and_geometry_queries": set(layout.query_groups) == {"ground", "geometry"},
+        "has_no_semantic_query_parameter": not hasattr(model, "semantic_queries"),
+        "action_layout_has_exact_query_groups": set(layout.query_groups)
+        == ({"geometry"} if args.mode == "semantic_geometry" else {"ground", "geometry"}),
+        "semantic_geometry_has_no_ground_modules": (
+            args.mode != "semantic_geometry"
+            or (not hasattr(model, "ground_queries") and not hasattr(model, "ground_head"))
+        ),
+        "production_uses_p2_joint_masked_semantic": joint_train_layout is not None,
         "semantic_loss_is_finite": bool(torch.isfinite(first_semantic)),
         "fixed_input_action_is_bitwise_deterministic": bool(torch.equal(first_action, second_action)),
         "fixed_input_semantic_ce_is_bitwise_deterministic": bool(torch.equal(first_semantic, second_semantic)),
         "changing_only_semantic_teacher_does_not_change_action": bool(torch.equal(first_action, changed_action)),
-        "changing_only_ground_teacher_does_not_change_action": bool(
-            torch.equal(first_action, changed_ground["action_loss_per_element"])
+        "changing_only_ground_teacher_does_not_change_action": (
+            True
+            if changed_ground is None
+            else bool(torch.equal(first_action, changed_ground["action_loss_per_element"]))
         ),
         "changing_only_geometry_teacher_does_not_change_action": bool(
             torch.equal(first_action, changed_geometry["action_loss_per_element"])
@@ -210,15 +257,17 @@ def main() -> None:
         "semantic_ce_reaches_shared_vision_path": vision_grad_nonzero,
         "semantic_ce_reaches_shared_language_path": language_grad_nonzero,
         "semantic_only_pass_never_calls_action_expert": expert_forward_calls == 0,
-        "ground_and_geometry_queries_receive_no_semantic_only_gradient": all(
-            getattr(model, name).grad is None for name in ("ground_queries", "geometry_queries")
+        "auxiliary_queries_receive_no_semantic_only_gradient": all(
+            getattr(model, name).grad is None
+            for name in (("geometry_queries",) if args.mode == "semantic_geometry" else ("ground_queries", "geometry_queries"))
         ),
     }
     if not all(checks.values()):
         raise RuntimeError(f"Native semantic LM gate failed: {checks}")
     payload = {
         "status": "PASS",
-        "gate": "pi05_p2_native_semantic_lm_and_no_action_leakage_v1",
+        "gate": f"pi05_{args.mode}_native_semantic_lm_and_no_action_leakage_v1",
+        "mode": args.mode,
         "sample_id": auxiliary["sample_id"],
         "overall_instruction": auxiliary["prompt"],
         "semantic_target": auxiliary["semantic_text"],
@@ -228,8 +277,9 @@ def main() -> None:
         "architecture": {
             "action_prefix_query_groups": list(layout.query_groups),
             "semantic_query_count": 0,
-            "semantic_objective": "separate native PaliGemma autoregressive LM pass",
-            "teacher_tokens_present_in_action_prefix": False,
+            "semantic_objective": "P2 joint-masked native PaliGemma autoregressive CE",
+            "teacher_tokens_present_in_joint_training_sequence": True,
+            "action_can_attend_semantic_teacher_tokens": False,
             "action_expert_forward_calls_in_semantic_only_pass": expert_forward_calls,
         },
         "metrics": {

@@ -10,18 +10,32 @@ import torch
 
 
 class ExponentialMovingAverage:
-    """Track every model parameter and temporarily expose EMA weights on a module."""
+    """Track model parameters with full-precision accumulation for low-precision training."""
 
-    _SCHEMA = "openpi.pytorch_ema.v1"
+    _SCHEMA = "openpi.pytorch_ema.v2"
 
     def __init__(self, module: torch.nn.Module, decay: float):
         if not 0.0 < decay < 1.0:
             raise ValueError(f"EMA decay must be in (0, 1), found {decay}")
         self.decay = float(decay)
         self.num_updates = 0
-        self._shadow = {name: parameter.detach().clone() for name, parameter in module.named_parameters()}
+        # A decay close to one produces updates much smaller than one BF16/FP16
+        # ULP. Accumulating those updates in the model dtype can permanently
+        # freeze the EMA shadow. Keep low-precision floating-point parameters in
+        # FP32 and cast only when the checkpoint is loaded into a BF16/FP16
+        # serving model.
+        self._shadow = {
+            name: parameter.detach().to(dtype=self._shadow_dtype(parameter), copy=True)
+            for name, parameter in module.named_parameters()
+        }
         if not self._shadow:
             raise ValueError("EMA requires a model with at least one parameter")
+
+    @staticmethod
+    def _shadow_dtype(parameter: torch.Tensor) -> torch.dtype:
+        if parameter.dtype in (torch.bfloat16, torch.float16):
+            return torch.float32
+        return parameter.dtype
 
     def _parameters(self, module: torch.nn.Module) -> dict[str, torch.nn.Parameter]:
         parameters = dict(module.named_parameters())
@@ -31,11 +45,17 @@ class ExponentialMovingAverage:
             raise RuntimeError(f"EMA parameter topology changed: missing={missing}, unexpected={unexpected}")
         for name, parameter in parameters.items():
             shadow = self._shadow[name]
-            if shadow.shape != parameter.shape or shadow.dtype != parameter.dtype or shadow.device != parameter.device:
+            expected_shadow_dtype = self._shadow_dtype(parameter)
+            if (
+                shadow.shape != parameter.shape
+                or shadow.dtype != expected_shadow_dtype
+                or shadow.device != parameter.device
+            ):
                 raise RuntimeError(
                     f"EMA parameter mismatch for {name}: "
                     f"shadow={shadow.shape}/{shadow.dtype}/{shadow.device}, "
-                    f"model={parameter.shape}/{parameter.dtype}/{parameter.device}"
+                    f"model={parameter.shape}/{parameter.dtype}/{parameter.device}, "
+                    f"expected_shadow_dtype={expected_shadow_dtype}"
                 )
         return parameters
 
@@ -70,6 +90,7 @@ class ExponentialMovingAverage:
             "decay": self.decay,
             "num_updates": self.num_updates,
             "parameter_names": tuple(self._shadow),
+            "shadow_dtypes": tuple((name, str(shadow.dtype)) for name, shadow in self._shadow.items()),
         }
 
     def load_metadata(self, metadata: dict, module: torch.nn.Module) -> None:
@@ -79,6 +100,12 @@ class ExponentialMovingAverage:
             raise RuntimeError(f"EMA decay mismatch: saved={metadata['decay']}, current={self.decay}")
         if tuple(metadata["parameter_names"]) != tuple(self._shadow):
             raise RuntimeError("EMA checkpoint parameter names do not match the current model")
+        expected_shadow_dtypes = tuple((name, str(shadow.dtype)) for name, shadow in self._shadow.items())
+        if tuple(tuple(item) for item in metadata.get("shadow_dtypes", ())) != expected_shadow_dtypes:
+            raise RuntimeError(
+                "EMA checkpoint shadow dtypes do not match full-precision accumulation: "
+                f"saved={metadata.get('shadow_dtypes')}, expected={expected_shadow_dtypes}"
+            )
         num_updates = int(metadata["num_updates"])
         if num_updates < 0:
             raise RuntimeError(f"EMA update count must be non-negative, found {num_updates}")
@@ -87,7 +114,13 @@ class ExponentialMovingAverage:
 
     @contextlib.contextmanager
     def average_parameters(self, module: torch.nn.Module):
-        """Swap EMA tensors into ``module`` without allocating a second model."""
+        """Swap EMA tensors into ``module`` without allocating a second model.
+
+        Low-precision module parameters temporarily become FP32 inside the
+        context. This is intended for checkpoint save/load, not model forward.
+        Loading the resulting FP32 checkpoint into a BF16/FP16 serving model
+        performs the single final cast after EMA accumulation.
+        """
 
         parameters = self._parameters(module)
         with torch.no_grad():
