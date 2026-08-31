@@ -9,6 +9,14 @@ from typing import Literal
 
 from openpi.training import config as openpi_config
 
+from .constants import AUGMENTED_EPISODES
+from .constants import AUGMENTED_FRAMES
+from .constants import AUGMENTED_MOTION_VALID
+from .constants import COMPLETED_EPISODES
+from .constants import COMPLETED_FRAMES
+from .constants import COMPLETED_MOTION_VALID
+from .constants import FOUR_SUITE_EPISODES
+from .constants import FOUR_SUITE_FRAMES
 from .constants import FOUR_SUITE_MOTION_VALID
 from .data_overlay import FourSuitePolicyAuxTrainConfig
 from .paths import ArtifactPaths
@@ -52,6 +60,16 @@ def build_train_config(
     wandb_enabled: bool = True,
     resume: bool = False,
     overwrite: bool = False,
+    supplemental_augmentation: bool = False,
+    official_completion: bool = False,
+    peak_lr: float | None = None,
+    decay_steps: int | None = None,
+    decay_lr: float | None = None,
+    save_interval: int = 1_000,
+    late_save_interval: int | None = 500,
+    late_save_start_step: int | None = 20_000,
+    max_checkpoints_to_keep: int = 30,
+    max_resume_checkpoints_to_keep: int = 2,
 ):
     if num_train_steps <= 0:
         raise ValueError("num_train_steps must be explicitly positive")
@@ -82,7 +100,21 @@ def build_train_config(
             assets_dir=str(Path(configured_assets).expanduser().resolve()),
         ),
     )
+    if supplemental_augmentation and official_completion:
+        raise ValueError("supplemental and official-completion populations are mutually exclusive")
     policy_aux = FourSuitePolicyAuxTrainConfig(
+        expected_episodes=(
+            COMPLETED_EPISODES
+            if official_completion
+            else AUGMENTED_EPISODES if supplemental_augmentation else FOUR_SUITE_EPISODES
+        ),
+        expected_frames=(
+            COMPLETED_FRAMES
+            if official_completion
+            else AUGMENTED_FRAMES if supplemental_augmentation else FOUR_SUITE_FRAMES
+        ),
+        supplemental_augmentation=supplemental_augmentation,
+        official_completion=official_completion,
         target_scope=expected_target_scope(variant),
         mode="semantic_geometry_motion",
         policy_manifest_path=str(artifacts.policy_manifest.resolve()),
@@ -91,7 +123,11 @@ def build_train_config(
         geometry_normalization_path=str(artifacts.geometry_normalization.resolve()),
         motion_target_index_path=str(artifacts.motion_index.resolve()),
         motion_normalization_path=str(artifacts.motion_normalization.resolve()),
-        motion_target_count=FOUR_SUITE_MOTION_VALID,
+        motion_target_count=(
+            COMPLETED_MOTION_VALID
+            if official_completion
+            else AUGMENTED_MOTION_VALID if supplemental_augmentation else FOUR_SUITE_MOTION_VALID
+        ),
         lambda_sem=0.01,
         lambda_geo=0.05,
         lambda_motion=0.05,
@@ -103,7 +139,13 @@ def build_train_config(
     )
     # The minimal manifest travels with the additive metadata bundle; large target
     # stores stay immutable in their source caches and are referenced by the indices.
-    schedule = dataclasses.replace(base.lr_schedule, warmup_steps=warmup_steps)
+    schedule = dataclasses.replace(
+        base.lr_schedule,
+        warmup_steps=warmup_steps,
+        **({"peak_lr": peak_lr} if peak_lr is not None else {}),
+        **({"decay_steps": decay_steps} if decay_steps is not None else {}),
+        **({"decay_lr": decay_lr} if decay_lr is not None else {}),
+    )
     return dataclasses.replace(
         base,
         name=CONFIG_NAMES[variant],
@@ -117,13 +159,13 @@ def build_train_config(
         seed=seed,
         batch_size=batch_size,
         num_workers=num_workers,
-        save_interval=1_000,
-        late_save_interval=500,
-        late_save_start_step=20_000,
+        save_interval=save_interval,
+        late_save_interval=late_save_interval,
+        late_save_start_step=late_save_start_step,
         keep_period=None,
         checkpoint_keep_steps=(),
-        max_checkpoints_to_keep=30,
-        max_resume_checkpoints_to_keep=2,
+        max_checkpoints_to_keep=max_checkpoints_to_keep,
+        max_resume_checkpoints_to_keep=max_resume_checkpoints_to_keep,
         wandb_enabled=wandb_enabled,
         resume=resume,
         overwrite=overwrite,

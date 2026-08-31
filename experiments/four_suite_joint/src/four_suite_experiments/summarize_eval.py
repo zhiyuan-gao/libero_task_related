@@ -10,7 +10,7 @@ from .constants import SUITES
 
 TASK_IDS = tuple(range(10))
 TRIALS_PER_TASK = 50
-SEED = 7
+DEFAULT_SEED = 7
 MAX_STEPS = {
     "libero_spatial": 220,
     "libero_object": 280,
@@ -33,7 +33,7 @@ def _load_records(paths: list[Path]) -> list[dict]:
     return records
 
 
-def summarize_suite(suite: str, inputs: list[Path]) -> dict:
+def summarize_suite(suite: str, inputs: list[Path], seed: int = DEFAULT_SEED) -> dict:
     if suite not in SUITES:
         raise SystemExit(f"Unknown four-suite benchmark: {suite}")
     records = _load_records(inputs)
@@ -63,7 +63,7 @@ def summarize_suite(suite: str, inputs: list[Path]) -> dict:
                 raise SystemExit(f"Suite identity mismatch in record: {record}")
             if int(record["shard_index"]) != expected_shard or int(record["num_shards"]) != num_shards:
                 raise SystemExit(f"Invalid shard assignment in record: {record}")
-            if int(record["seed"]) != SEED or record.get("error") is not None:
+            if int(record["seed"]) != seed or record.get("error") is not None:
                 raise SystemExit(f"Invalid formal record: {record}")
         successes = sum(bool(record["success"]) for record in task_records)
         by_task[str(task_id)] = {
@@ -78,7 +78,7 @@ def summarize_suite(suite: str, inputs: list[Path]) -> dict:
         "protocol": {
             "suite": suite,
             "benchmark_task_ids": list(TASK_IDS),
-            "seed": SEED,
+            "seed": seed,
             "trials_per_task": TRIALS_PER_TASK,
             "num_shards": num_shards,
             "max_steps": MAX_STEPS[suite],
@@ -138,6 +138,7 @@ def main() -> None:
 
     suite_parser = subparsers.add_parser("suite")
     suite_parser.add_argument("--suite", choices=SUITES, required=True)
+    suite_parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     suite_parser.add_argument("--output", type=Path, required=True)
     suite_parser.add_argument("inputs", nargs="+", type=Path)
 
@@ -152,7 +153,9 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "suite":
-        summary = summarize_suite(args.suite, args.inputs)
+        if args.seed < 0:
+            raise SystemExit("Evaluation seed must be non-negative")
+        summary = summarize_suite(args.suite, args.inputs, seed=args.seed)
     elif args.command == "checkpoint":
         summary = summarize_checkpoint(args.inputs, args.checkpoint_step)
     else:

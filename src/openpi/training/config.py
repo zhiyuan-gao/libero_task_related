@@ -489,6 +489,11 @@ class TrainConfig:
 
     # Optional path to a PyTorch checkpoint to load weights from.
     pytorch_weight_path: str | None = None
+    # ``official_base`` enforces that auxiliary parameters are absent and only
+    # initializes them locally. ``strict`` warm-starts every model parameter
+    # from a complete training/evaluation checkpoint without restoring any
+    # optimizer, scheduler, RNG, or DataLoader state.
+    pytorch_weight_load_mode: Literal["official_base", "strict"] = "official_base"
 
     # Precision for PyTorch training.
     pytorch_training_precision: Literal["bfloat16", "float32"] = "bfloat16"
@@ -582,6 +587,8 @@ class TrainConfig:
         return nnx.All(nnx.Param, nnx.Not(self.freeze_filter))
 
     def __post_init__(self) -> None:
+        if self.pytorch_weight_load_mode not in ("official_base", "strict"):
+            raise ValueError(f"Unsupported PyTorch weight load mode: {self.pytorch_weight_load_mode}")
         if self.resume and self.overwrite:
             raise ValueError("Cannot resume and overwrite at the same time.")
         if (self.late_save_interval is None) != (self.late_save_start_step is None):

@@ -231,6 +231,14 @@ def trajectory_config(config: _config.TrainConfig | dict) -> dict:
     """Return only fields that can affect the optimizer/data trajectory."""
 
     payload = dataclasses.asdict(config) if dataclasses.is_dataclass(config) else dict(config)
+    # Preserve exact-resume compatibility across an additive schema field.  A
+    # checkpoint written before the completed-1,932 population was introduced
+    # has the same semantics as ``official_completion=False``.
+    policy_aux = payload.get("policy_aux")
+    if isinstance(policy_aux, dict):
+        policy_aux = dict(policy_aux)
+        policy_aux.setdefault("official_completion", False)
+        payload["policy_aux"] = policy_aux
     return {key: value for key, value in payload.items() if key not in _RESUME_RUNTIME_FIELDS}
 
 
@@ -777,11 +785,16 @@ def train_loop(config: _config.TrainConfig):
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
         model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        if isinstance(model_to_load, _pi05_aux.PI05AuxPolicy) and model_to_load.aux_enabled:
+        if (
+            config.pytorch_weight_load_mode == "official_base"
+            and isinstance(model_to_load, _pi05_aux.PI05AuxPolicy)
+            and model_to_load.aux_enabled
+        ):
             load_result = model_to_load.load_official_base_checkpoint(model_path, device=str(device))
             logging.info(f"Loaded official base with exact auxiliary missing keys: {load_result}")
         else:
             safetensors.torch.load_model(model_to_load, model_path, strict=True)
+            logging.info(f"Strict-loaded the complete PyTorch model ({config.pytorch_weight_load_mode=})")
         logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
 
     model_for_state = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model

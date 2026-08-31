@@ -2,17 +2,23 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 from pathlib import Path
+import subprocess
 
 from four_suite_experiments.configs import blocked_action_groups
 from four_suite_experiments.configs import build_train_config
 from four_suite_experiments.configs import expected_target_scope
+from four_suite_experiments.constants import COMPLETED_EPISODES
+from four_suite_experiments.constants import COMPLETED_FRAMES
+from four_suite_experiments.constants import COMPLETED_MOTION_VALID
 from four_suite_experiments.constants import FOUR_SUITE_EPISODES
 from four_suite_experiments.constants import FOUR_SUITE_FRAMES
 from four_suite_experiments.data_overlay import FourSuitePolicyAuxTrainConfig
 from four_suite_experiments.data_overlay import FourSuitePolicyAuxTransformedDataset
 from four_suite_experiments.data_overlay import install_data_overlay
 from four_suite_experiments.paths import ArtifactPaths
+import pytest
 
 from openpi.training import policy_aux_dataset as upstream_policy_aux_dataset
 
@@ -157,9 +163,92 @@ def test_whole_scene_variant_changes_only_scope_and_artifact_paths(tmp_path) -> 
     assert task.policy_aux.motion_target_index_path != whole.policy_aux.motion_target_index_path
 
 
+def test_official_completion_population_is_explicit_and_mutually_exclusive(tmp_path) -> None:
+    common = {
+        "variant": "trqc",
+        "artifacts": ArtifactPaths(tmp_path / "artifacts"),
+        "exp_name": "official_completion",
+        "num_train_steps": 3_000,
+        "warmup_steps": 200,
+        "checkpoint_base_dir": tmp_path / "checkpoints",
+        "lerobot_root": tmp_path / "a4336d589d589045d1c56423ffdf3b88a0e19b1f",
+        "base_weight_path": tmp_path / "step30000",
+        "libero_assets_dir": tmp_path / "assets",
+        "wandb_enabled": False,
+    }
+    completed = build_train_config(official_completion=True, **common)
+    assert completed.policy_aux.expected_episodes == COMPLETED_EPISODES == 1_932
+    assert completed.policy_aux.expected_frames == COMPLETED_FRAMES == 328_636
+    assert completed.policy_aux.motion_target_count == COMPLETED_MOTION_VALID == 309_147
+    assert completed.policy_aux.official_completion is True
+    assert completed.policy_aux.supplemental_augmentation is False
+
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        build_train_config(
+            supplemental_augmentation=True,
+            official_completion=True,
+            **common,
+        )
+
+
 def test_8gpu_launcher_uses_validated_allocator_settings() -> None:
     launcher = Path(__file__).resolve().parents[1] / "jobs/run_8gpu.sh"
     text = launcher.read_text()
     assert "export OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=1" in text
     assert "export OPENPI_LOG_MEMORY_STATS=0" in text
     assert "export TOKENIZERS_PARALLELISM=false" in text
+
+
+def test_official_completion_continuation_is_one_continuous_6k_schedule(tmp_path) -> None:
+    config = build_train_config(
+        variant="trqc",
+        artifacts=ArtifactPaths(tmp_path / "artifacts"),
+        exp_name="continuous_6k",
+        num_train_steps=6_000,
+        warmup_steps=200,
+        checkpoint_base_dir=tmp_path / "checkpoints",
+        lerobot_root=tmp_path / "a4336d589d589045d1c56423ffdf3b88a0e19b1f",
+        base_weight_path=tmp_path / "parent" / "30000",
+        libero_assets_dir=tmp_path / "assets",
+        wandb_enabled=False,
+        peak_lr=1e-5,
+        decay_steps=6_000,
+        decay_lr=1e-6,
+        save_interval=500,
+        late_save_interval=None,
+        late_save_start_step=None,
+        max_checkpoints_to_keep=12,
+        max_resume_checkpoints_to_keep=2,
+        official_completion=True,
+    )
+    assert config.num_train_steps == 6_000
+    assert config.lr_schedule.warmup_steps == 200
+    assert config.lr_schedule.decay_steps == 6_000
+    assert config.save_interval == 500
+    assert config.max_checkpoints_to_keep == 12
+    assert config.max_resume_checkpoints_to_keep == 2
+
+
+def test_dual_continuation_plan_is_ordered_and_formal_launch_is_gated(tmp_path) -> None:
+    jobs = Path(__file__).resolve().parents[1] / "jobs"
+    controller = jobs / "run_dual_continuation_8gpu.sh"
+    background = jobs / "launch_dual_continuation_background.sh"
+    env = os.environ.copy()
+    env["FOUR_SUITE_CHECKPOINT_BASE_DIR"] = str(tmp_path / "checkpoints")
+    result = subprocess.run(
+        ["bash", str(controller), "plan"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    lines = result.stdout.strip().splitlines()
+    assert len(lines) == 2
+    assert "1932_from_main" in lines[0]
+    assert "continuous_updates=6000" in lines[0]
+    assert "final=6000" in lines[0]
+    assert "old115_exact_continue" in lines[1]
+    assert "population=1808" in lines[1]
+    assert "additional_updates=3000" in lines[1]
+    assert "final=6000" in lines[1]
+    assert "LIBERO_DUAL_CONTINUATION_APPROVED" in background.read_text()

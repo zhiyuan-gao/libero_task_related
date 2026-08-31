@@ -19,6 +19,7 @@ SAVE_VIDEO="${SAVE_VIDEO:-0}"
 DRY_RUN="${DRY_RUN:-0}"
 TORCH_COMPILE_CACHE_ROOT="${TORCH_COMPILE_CACHE_ROOT:-${RUN_ROOT}/torch_compile_cache}"
 NUM_SHARDS="${NUM_SHARDS:-16}"
+EVAL_SEED="${EVAL_SEED:-7}"
 
 readonly NUM_GPUS=8
 readonly NUM_SHARDS
@@ -48,6 +49,10 @@ if [[ ! "${NUM_SHARDS}" =~ ^[0-9]+$ ]]; then
   echo "NUM_SHARDS must be an integer; observed ${NUM_SHARDS}" >&2
   exit 2
 fi
+if [[ ! "${EVAL_SEED}" =~ ^[0-9]+$ ]]; then
+  echo "EVAL_SEED must be a non-negative integer; observed ${EVAL_SEED}" >&2
+  exit 2
+fi
 if ((NUM_SHARDS < NUM_GPUS || NUM_SHARDS % NUM_GPUS != 0)); then
   echo "NUM_SHARDS must be a positive multiple of ${NUM_GPUS}; observed ${NUM_SHARDS}" >&2
   exit 2
@@ -61,18 +66,25 @@ if [[ "${RESUME}" != 1 && -e "${RUN_ROOT}" ]]; then
   exit 2
 fi
 
+protocol="formal_four_suite"
+alternate_seed_arg=()
+if [[ "${EVAL_SEED}" != 7 ]]; then
+  protocol="formal_four_suite_multiseed"
+  alternate_seed_arg=(--args.allow-alternate-formal-seed)
+fi
+
 manifest="checkpoint=${CHECKPOINT}
 checkpoint_step=${CHECKPOINT_STEP}
 variant=${VARIANT}
 suites=libero_spatial,libero_object,libero_goal,libero_10
 task_ids=0,1,2,3,4,5,6,7,8,9
 trials_per_task=50
-seed=7
+seed=${EVAL_SEED}
 num_shards=${NUM_SHARDS}
 resize=224
 replan_steps=5
 policy_flow_steps=10
-protocol=formal_four_suite"
+protocol=${protocol}"
 
 if [[ "${DRY_RUN}" == 1 ]]; then
   echo "DRY RUN OK: checkpoint=${CHECKPOINT_STEP} variant=${VARIANT}"
@@ -217,7 +229,8 @@ for suite in "${suites[@]}"; do
         --args.task-ids "${task_ids[@]}" \
         --args.num-shards "${NUM_SHARDS}" \
         --args.shard-index "${shard}" \
-        --args.seed 7 \
+        --args.seed "${EVAL_SEED}" \
+        "${alternate_seed_arg[@]}" \
         --args.output-jsonl "${suite_root}/results/shard_${shard}.jsonl" \
         --args.video-out-path "${suite_root}/videos" \
         "${video_arg}" \
@@ -236,6 +249,7 @@ for suite in "${suites[@]}"; do
   fi
   "${PYTHON_BIN}" -m four_suite_experiments.summarize_eval suite \
     --suite "${suite}" \
+    --seed "${EVAL_SEED}" \
     --output "${suite_root}/summary.json" \
     "${suite_root}"/results/shard_*.jsonl \
     >"${suite_root}/summary.txt"

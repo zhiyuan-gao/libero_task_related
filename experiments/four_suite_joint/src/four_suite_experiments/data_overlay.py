@@ -12,6 +12,16 @@ import pandas as pd
 
 from openpi.training import policy_aux_dataset as upstream
 
+from .constants import AUGMENTED_EPISODES
+from .constants import AUGMENTED_FRAMES
+from .constants import AUGMENTED_GEOMETRY_INVALID
+from .constants import AUGMENTED_GEOMETRY_VALID
+from .constants import AUGMENTED_MOTION_VALID
+from .constants import COMPLETED_EPISODES
+from .constants import COMPLETED_FRAMES
+from .constants import COMPLETED_GEOMETRY_INVALID
+from .constants import COMPLETED_GEOMETRY_VALID
+from .constants import COMPLETED_MOTION_VALID
 from .constants import FOUR_SUITE_EPISODES
 from .constants import FOUR_SUITE_FRAMES
 from .constants import FOUR_SUITE_GEOMETRY_INVALID
@@ -32,15 +42,36 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
     expected_episodes: int = FOUR_SUITE_EPISODES
     expected_frames: int = FOUR_SUITE_FRAMES
     target_scope: str = "task_relevant"
+    supplemental_augmentation: bool = False
+    official_completion: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.lerobot_task_indices is not None:
             raise ValueError("four-suite training requires all 40 tasks")
-        if self.expected_episodes != FOUR_SUITE_EPISODES or self.expected_frames != FOUR_SUITE_FRAMES:
-            raise ValueError("four-suite population counts are frozen")
-        if self.motion_target_count != FOUR_SUITE_MOTION_VALID:
-            raise ValueError(f"four-suite Motion count must be {FOUR_SUITE_MOTION_VALID}")
+        if self.supplemental_augmentation and self.official_completion:
+            raise ValueError("supplemental and official-completion populations are mutually exclusive")
+        expected_episodes = (
+            COMPLETED_EPISODES
+            if self.official_completion
+            else AUGMENTED_EPISODES if self.supplemental_augmentation else FOUR_SUITE_EPISODES
+        )
+        expected_frames = (
+            COMPLETED_FRAMES
+            if self.official_completion
+            else AUGMENTED_FRAMES if self.supplemental_augmentation else FOUR_SUITE_FRAMES
+        )
+        expected_motion = (
+            COMPLETED_MOTION_VALID
+            if self.official_completion
+            else AUGMENTED_MOTION_VALID if self.supplemental_augmentation else FOUR_SUITE_MOTION_VALID
+        )
+        if self.expected_episodes != expected_episodes or self.expected_frames != expected_frames:
+            raise ValueError("four-suite population counts differ from the selected frozen population")
+        if self.motion_target_count != expected_motion:
+            raise ValueError(f"four-suite Motion count must be {expected_motion}")
+        if (self.supplemental_augmentation or self.official_completion) and self.target_scope != "task_relevant":
+            raise ValueError("the supplemental continuation is defined only for task-relevant targets")
         if self.target_scope not in ("task_relevant", "whole_scene"):
             raise ValueError(f"unsupported four-suite target scope: {self.target_scope}")
 
@@ -51,14 +82,14 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
             mapping.get("status") != "PASS"
             or mapping.get("hf_repo_id") != LIBERO_REPO_ID
             or mapping.get("hf_revision") != LIBERO_REVISION
-            or int(mapping.get("mapped_episode_count", -1)) != FOUR_SUITE_EPISODES
-            or int(mapping.get("mapped_frame_count", -1)) != FOUR_SUITE_FRAMES
-            or len(records) != FOUR_SUITE_EPISODES
-            or sum(int(row["episode_length"]) for row in records) != FOUR_SUITE_FRAMES
+            or int(mapping.get("mapped_episode_count", -1)) != self.expected_episodes
+            or int(mapping.get("mapped_frame_count", -1)) != self.expected_frames
+            or len(records) != self.expected_episodes
+            or sum(int(row["episode_length"]) for row in records) != self.expected_frames
         ):
             raise ValueError("four-suite episode mapping is not the frozen official population")
         records = sorted(records, key=lambda row: int(row["lerobot_episode_index"]))
-        if [int(row["lerobot_episode_index"]) for row in records] != list(range(FOUR_SUITE_EPISODES)):
+        if [int(row["lerobot_episode_index"]) for row in records] != list(range(self.expected_episodes)):
             raise ValueError("four-suite episode mapping is not contiguous")
         return records
 
@@ -73,7 +104,7 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
             if stop - start != int(row["episode_length"]):
                 raise ValueError(f"invalid dataset range in episode mapping: {row}")
             indices.extend(range(start, stop))
-        if indices != list(range(FOUR_SUITE_FRAMES)):
+        if indices != list(range(self.expected_frames)):
             raise ValueError("four-suite dataset frame identities are not exactly contiguous")
         return indices
 
@@ -81,22 +112,23 @@ class FourSuitePolicyAuxTrainConfig(upstream.PolicyAuxTrainConfig):
 class FourSuiteAnnotationIndex:
     """Minimal direct lookup of stable sample identity and Semantic target."""
 
-    def __init__(self, manifest_path: str | Path) -> None:
+    def __init__(self, manifest_path: str | Path, *, expected_frames: int = FOUR_SUITE_FRAMES) -> None:
         self.manifest_path = Path(manifest_path).resolve(strict=True)
         frame = pd.read_parquet(
             self.manifest_path,
             columns=["lerobot_dataset_index", "sample_id", "semantic_subtask"],
         ).sort_values("lerobot_dataset_index")
-        if len(frame) != FOUR_SUITE_FRAMES or not frame["sample_id"].is_unique:
+        if len(frame) != expected_frames or not frame["sample_id"].is_unique:
             raise ValueError("four-suite annotation manifest has the wrong frame population")
-        if frame["lerobot_dataset_index"].astype(int).tolist() != list(range(FOUR_SUITE_FRAMES)):
+        if frame["lerobot_dataset_index"].astype(int).tolist() != list(range(expected_frames)):
             raise ValueError("four-suite annotation manifest is not in exact LeRobot order")
         if frame["semantic_subtask"].isna().any():
             raise ValueError("four-suite annotation manifest has missing Semantic targets")
         self._frame = frame.reset_index(drop=True)
+        self.expected_frames = expected_frames
 
     def row_by_dataset_index(self, dataset_index: int) -> pd.Series:
-        if dataset_index < 0 or dataset_index >= FOUR_SUITE_FRAMES:
+        if dataset_index < 0 or dataset_index >= self.expected_frames:
             raise IndexError(dataset_index)
         row = self._frame.iloc[int(dataset_index)]
         if int(row["lerobot_dataset_index"]) != int(dataset_index):
@@ -107,7 +139,15 @@ class FourSuiteAnnotationIndex:
 class FourSuiteGeometryTargetIndex:
     """Read multiple immutable Geometry memmaps through one ordered index."""
 
-    def __init__(self, target_index_path: str | Path, normalization_path: str | Path) -> None:
+    def __init__(
+        self,
+        target_index_path: str | Path,
+        normalization_path: str | Path,
+        *,
+        expected_frames: int = FOUR_SUITE_FRAMES,
+        expected_valid: int = FOUR_SUITE_GEOMETRY_VALID,
+        expected_invalid: int = FOUR_SUITE_GEOMETRY_INVALID,
+    ) -> None:
         self.target_index_path = Path(target_index_path).resolve(strict=True)
         self.normalization_path = Path(normalization_path).resolve(strict=True)
         frame = pd.read_parquet(
@@ -122,12 +162,12 @@ class FourSuiteGeometryTargetIndex:
                 "target_dtype",
             ],
         ).sort_values("lerobot_dataset_index")
-        if len(frame) != FOUR_SUITE_FRAMES or not frame["sample_id"].is_unique:
+        if len(frame) != expected_frames or not frame["sample_id"].is_unique:
             raise ValueError("four-suite Geometry index has the wrong frame population")
-        if frame["lerobot_dataset_index"].astype(int).tolist() != list(range(FOUR_SUITE_FRAMES)):
+        if frame["lerobot_dataset_index"].astype(int).tolist() != list(range(expected_frames)):
             raise ValueError("four-suite Geometry index is not in exact LeRobot order")
         valid = frame["geometry_valid"].astype(bool)
-        if int(valid.sum()) != FOUR_SUITE_GEOMETRY_VALID or int((~valid).sum()) != FOUR_SUITE_GEOMETRY_INVALID:
+        if int(valid.sum()) != expected_valid or int((~valid).sum()) != expected_invalid:
             raise ValueError("four-suite Geometry validity counts differ")
         if frame.loc[valid, "target_memmap_path"].isna().any() or frame.loc[valid, "target_memmap_row"].isna().any():
             raise ValueError("valid four-suite Geometry rows lack target locations")
@@ -137,12 +177,13 @@ class FourSuiteGeometryTargetIndex:
             raise ValueError("four-suite Geometry target dtypes differ")
         self._frame = frame.reset_index(drop=True)
         self._targets: dict[str, np.ndarray] = {}
+        self.expected_frames = expected_frames
 
         normalization = json.loads(self.normalization_path.read_text())
         if (
             normalization.get("status") != "PASS"
             or normalization.get("split") != "train"
-            or int(normalization.get("sample_count", -1)) != FOUR_SUITE_GEOMETRY_VALID
+            or int(normalization.get("sample_count", -1)) != expected_valid
             or int(normalization.get("feature_dim", -1)) != GEOMETRY_DIM
         ):
             raise ValueError("four-suite Geometry normalization metadata differs")
@@ -163,7 +204,7 @@ class FourSuiteGeometryTargetIndex:
         return self._targets[path]
 
     def target_by_dataset_index(self, dataset_index: int) -> tuple[np.ndarray | None, bool, str]:
-        if dataset_index < 0 or dataset_index >= FOUR_SUITE_FRAMES:
+        if dataset_index < 0 or dataset_index >= self.expected_frames:
             raise IndexError(dataset_index)
         row = self._frame.iloc[int(dataset_index)]
         if int(row["lerobot_dataset_index"]) != int(dataset_index):
@@ -251,16 +292,40 @@ class FourSuitePolicyAuxTargetIndex:
 
     def __init__(self, config: FourSuitePolicyAuxTrainConfig) -> None:
         self.config = config
-        self.annotations = FourSuiteAnnotationIndex(config.policy_manifest_path)
+        expected_geometry_valid = (
+            COMPLETED_GEOMETRY_VALID
+            if config.official_completion
+            else AUGMENTED_GEOMETRY_VALID if config.supplemental_augmentation
+            else FOUR_SUITE_GEOMETRY_VALID
+        )
+        expected_geometry_invalid = (
+            COMPLETED_GEOMETRY_INVALID
+            if config.official_completion
+            else AUGMENTED_GEOMETRY_INVALID if config.supplemental_augmentation
+            else FOUR_SUITE_GEOMETRY_INVALID
+        )
+        expected_motion = (
+            COMPLETED_MOTION_VALID
+            if config.official_completion
+            else AUGMENTED_MOTION_VALID if config.supplemental_augmentation
+            else FOUR_SUITE_MOTION_VALID
+        )
+        self.annotations = FourSuiteAnnotationIndex(
+            config.policy_manifest_path,
+            expected_frames=config.expected_frames,
+        )
         self.geometry = FourSuiteGeometryTargetIndex(
             config.geometry_target_index_path,
             config.geometry_normalization_path,
+            expected_frames=config.expected_frames,
+            expected_valid=expected_geometry_valid,
+            expected_invalid=expected_geometry_invalid,
         )
         self.motion = (
             FourSuiteMotionTargetIndex(
                 config.motion_target_index_path,
                 config.motion_normalization_path,
-                expected_count=FOUR_SUITE_MOTION_VALID,
+                expected_count=expected_motion,
             )
             if config.mode in ("semantic_geometry_motion", "semantic_geometry_motion_binary_ground")
             else None

@@ -25,7 +25,7 @@ fi
 
 command="${1:-}"
 if [[ -z "${command}" ]]; then
-  echo "Usage: $0 {download-data|prepare|preflight|train|test} [arguments...]" >&2
+  echo "Usage: $0 {download-data|prepare|assemble-supplemental115|preflight|train|supplemental-finetune|test} [arguments...]" >&2
   exit 2
 fi
 shift
@@ -36,6 +36,9 @@ case "${command}" in
     ;;
   prepare)
     exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.prepare_joint_artifacts "$@"
+    ;;
+  assemble-supplemental115)
+    exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.assemble_supplemental115 "$@"
     ;;
   preflight)
     exec "${FOUR_SUITE_PYTHON}" -m four_suite_experiments.validate "$@"
@@ -50,6 +53,20 @@ case "${command}" in
       --nnodes=1 \
       --nproc_per_node=8 \
       -m four_suite_experiments.train \
+      --checkpoint-base-dir "${CHECKPOINT_BASE_DIR}" \
+      "$@"
+    ;;
+  supplemental-finetune)
+    if [[ "${FOUR_SUITE_SUPPLEMENTAL_FINETUNE_APPROVED:-}" != "YES" ]]; then
+      echo "Supplemental fine-tuning is gated. Set FOUR_SUITE_SUPPLEMENTAL_FINETUNE_APPROVED=YES." >&2
+      exit 3
+    fi
+    exec "${FOUR_SUITE_TORCHRUN}" \
+      --standalone \
+      --nnodes=1 \
+      --nproc_per_node=8 \
+      -m four_suite_experiments.supplemental_finetune \
+      --openpi-root "${OPENPI_ROOT}" \
       --checkpoint-base-dir "${CHECKPOINT_BASE_DIR}" \
       "$@"
     ;;

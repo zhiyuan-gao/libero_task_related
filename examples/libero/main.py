@@ -66,6 +66,9 @@ class Args:
     # Enforce the frozen LIBERO-10 evaluation recipe. Use --no-formal only for
     # explicitly labelled smoke/debug rollouts.
     formal: bool = True
+    # Alternate seeds are permitted only for an explicitly labelled formal
+    # multi-seed replication. All other formal protocol fields stay frozen.
+    allow_alternate_formal_seed: bool = False
 
 
 def _validate_formal_protocol(args: Args) -> None:
@@ -76,13 +79,20 @@ def _validate_formal_protocol(args: Args) -> None:
         "replan_steps": 5,
         "num_steps_wait": 10,
         "num_trials_per_task": 50,
-        "seed": 7,
     }
     observed = {name: getattr(args, name) for name in expected}
     if observed != expected:
         raise ValueError(
             "Formal LIBERO evaluation parameters are frozen. "
             f"expected={expected}, observed={observed}. Use --no-formal only for smoke/debug evaluation."
+        )
+    if args.seed < 0:
+        raise ValueError(f"Formal LIBERO evaluation seed must be non-negative; observed {args.seed}.")
+    if args.seed != 7 and not args.allow_alternate_formal_seed:
+        raise ValueError(
+            "Formal LIBERO evaluation seed is frozen to 7 unless this is an explicitly labelled "
+            "multi-seed replication. Pass --args.allow-alternate-formal-seed only for that protocol; "
+            f"observed seed={args.seed}."
         )
     task_ids = tuple(args.task_ids)
     valid_population = (args.task_suite_name == "libero_10" and task_ids == LIBERO3_BENCHMARK_TASK_IDS) or (
