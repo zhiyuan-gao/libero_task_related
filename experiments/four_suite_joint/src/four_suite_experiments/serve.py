@@ -64,6 +64,11 @@ def main() -> None:
         host="0.0.0.0",
         port=args.port,
         metadata=policy.metadata,
+        # A first max-autotune compile can take several minutes. The inference
+        # call is synchronous and blocks this server's asyncio loop, so a
+        # protocol-level keepalive would incorrectly close every queued local
+        # simulator connection during that one-time compile.
+        ping_interval=None,
     )
     logging.info("Serving %s checkpoint %s on port %d", args.variant, checkpoint, args.port)
     server.serve_forever()

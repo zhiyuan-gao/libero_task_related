@@ -22,6 +22,7 @@ NUM_SHARDS="${NUM_SHARDS:-16}"
 EVAL_SEED="${EVAL_SEED:-7}"
 
 readonly NUM_GPUS=8
+readonly NUM_POLICY_SERVERS="${NUM_GPUS}"
 readonly NUM_SHARDS
 readonly CHECKPOINT_STEP="$(basename "${CHECKPOINT}")"
 task_ids=(0 1 2 3 4 5 6 7 8 9)
@@ -53,11 +54,11 @@ if [[ ! "${EVAL_SEED}" =~ ^[0-9]+$ ]]; then
   echo "EVAL_SEED must be a non-negative integer; observed ${EVAL_SEED}" >&2
   exit 2
 fi
-if ((NUM_SHARDS < NUM_GPUS || NUM_SHARDS % NUM_GPUS != 0)); then
-  echo "NUM_SHARDS must be a positive multiple of ${NUM_GPUS}; observed ${NUM_SHARDS}" >&2
+if ((NUM_SHARDS != 8 && NUM_SHARDS != 16 && NUM_SHARDS != 24)); then
+  echo "NUM_SHARDS must be one of 8, 16, or 24 simulator workers; observed ${NUM_SHARDS}" >&2
   exit 2
 fi
-if [[ "${PORT_BASE}" -lt 1024 || $((PORT_BASE + NUM_SHARDS - 1)) -gt 65535 ]]; then
+if [[ "${PORT_BASE}" -lt 1024 || $((PORT_BASE + NUM_POLICY_SERVERS - 1)) -gt 65535 ]]; then
   echo "Invalid PORT_BASE: ${PORT_BASE}" >&2
   exit 2
 fi
@@ -81,6 +82,7 @@ task_ids=0,1,2,3,4,5,6,7,8,9
 trials_per_task=50
 seed=${EVAL_SEED}
 num_shards=${NUM_SHARDS}
+num_policy_servers=${NUM_POLICY_SERVERS}
 resize=224
 replan_steps=5
 policy_flow_steps=10
@@ -88,7 +90,8 @@ protocol=${protocol}"
 
 if [[ "${DRY_RUN}" == 1 ]]; then
   echo "DRY RUN OK: checkpoint=${CHECKPOINT_STEP} variant=${VARIANT}"
-  echo "Would launch ${NUM_SHARDS} policy workers across ${NUM_GPUS} GPUs and 2,000 formal rollouts across four suites."
+  echo "Would launch ${NUM_POLICY_SERVERS} policy servers and ${NUM_SHARDS} simulator workers across ${NUM_GPUS} GPUs."
+  echo "The simulator workers would execute 2,000 formal rollouts across four suites."
   exit 0
 fi
 
@@ -127,14 +130,18 @@ cores_per_pair=$((cpu_count / NUM_SHARDS))
 ((cores_per_pair >= 1)) || cores_per_pair=1
 threads_per_process=$((cores_per_pair / 2))
 ((threads_per_process >= 1)) || threads_per_process=1
+server_threads=2
 
 cpu_set_for_worker() {
   local worker="$1"
   local gpu=$((worker % NUM_GPUS))
   local replica=$((worker / NUM_GPUS))
   local replicas_per_gpu=$((NUM_SHARDS / NUM_GPUS))
-  if ((cpu_count == 128 && 8 % replicas_per_gpu == 0)); then
-    local physical_cores_per_pair=$((8 / replicas_per_gpu))
+  # On the validated 128-thread host, reserve two physical cores (and their
+  # SMT siblings) per GPU for the single policy server. Divide the remaining
+  # six physical cores evenly among the 1/2/3 simulator workers on that GPU.
+  if ((cpu_count == 128 && 6 % replicas_per_gpu == 0)); then
+    local physical_cores_per_pair=$((6 / replicas_per_gpu))
     local first_core=$((gpu * 8 + replica * physical_cores_per_pair))
     local last_core=$((first_core + physical_cores_per_pair - 1))
     echo "${first_core}-${last_core},$((first_core + 64))-$((last_core + 64))"
@@ -146,23 +153,32 @@ cpu_set_for_worker() {
   echo "${first_core}-${last_core}"
 }
 
+cpu_set_for_server() {
+  local gpu="$1"
+  if ((cpu_count == 128)); then
+    local first_core=$((gpu * 8 + 6))
+    local last_core=$((gpu * 8 + 7))
+    echo "${first_core}-${last_core},$((first_core + 64))-$((last_core + 64))"
+    return
+  fi
+  # On an unknown topology, policy inference is GPU-bound. Let the operating
+  # system schedule the lightweight server-side preprocessing on all CPUs.
+  echo ""
+}
+
 export PYTHONPATH="${PROJECT_ROOT}/src:${OPENPI_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
-for worker in $(seq 0 $((NUM_SHARDS - 1))); do
-  gpu=$((worker % NUM_GPUS))
-  replica=$((worker / NUM_GPUS))
-  port=$((PORT_BASE + worker))
-  cpu_set="$(cpu_set_for_worker "${worker}")"
+for gpu in $(seq 0 $((NUM_POLICY_SERVERS - 1))); do
+  port=$((PORT_BASE + gpu))
+  cpu_set="$(cpu_set_for_server "${gpu}")"
   cache_leaf="gpu${gpu}"
-  ((replica == 0)) || cache_leaf="gpu${gpu}_replica${replica}"
   mkdir -p "${TORCH_COMPILE_CACHE_ROOT}/${cache_leaf}/inductor" "${TORCH_COMPILE_CACHE_ROOT}/${cache_leaf}/triton"
-  env \
+  server_command=(env
     CUDA_VISIBLE_DEVICES="${gpu}" \
-    OMP_NUM_THREADS="${threads_per_process}" \
-    MKL_NUM_THREADS="${threads_per_process}" \
-    OPENBLAS_NUM_THREADS="${threads_per_process}" \
+    OMP_NUM_THREADS="${server_threads}" \
+    MKL_NUM_THREADS="${server_threads}" \
+    OPENBLAS_NUM_THREADS="${server_threads}" \
     TORCHINDUCTOR_CACHE_DIR="${TORCH_COMPILE_CACHE_ROOT}/${cache_leaf}/inductor" \
     TRITON_CACHE_DIR="${TORCH_COMPILE_CACHE_ROOT}/${cache_leaf}/triton" \
-    taskset -c "${cpu_set}" \
     "${PYTHON_BIN}" -m four_suite_experiments.serve \
       --variant "${VARIANT}" \
       --checkpoint "${CHECKPOINT}" \
@@ -170,30 +186,33 @@ for worker in $(seq 0 $((NUM_SHARDS - 1))); do
       --base-weight-path "${BASE_WEIGHT_PATH}" \
       --libero-assets-dir "${LIBERO_ASSETS_DIR}" \
       --port "${port}" \
-      --num-steps 10 \
-      >"${RUN_ROOT}/logs/server_worker${worker}_gpu${gpu}.log" 2>&1 &
+      --num-steps 10)
+  if [[ -n "${cpu_set}" ]]; then
+    server_command=(taskset -c "${cpu_set}" "${server_command[@]}")
+  fi
+  "${server_command[@]}" >"${RUN_ROOT}/logs/server_gpu${gpu}.log" 2>&1 &
   server_pids+=("$!")
 done
 
 ready=0
 for _ in $(seq 1 300); do
   ready=0
-  for worker in $(seq 0 $((NUM_SHARDS - 1))); do
-    if curl --silent --fail --max-time 1 "http://127.0.0.1:$((PORT_BASE + worker))/healthz" >/dev/null; then
+  for gpu in $(seq 0 $((NUM_POLICY_SERVERS - 1))); do
+    if curl --silent --fail --max-time 1 "http://127.0.0.1:$((PORT_BASE + gpu))/healthz" >/dev/null; then
       ready=$((ready + 1))
     fi
   done
-  [[ "${ready}" -eq "${NUM_SHARDS}" ]] && break
+  [[ "${ready}" -eq "${NUM_POLICY_SERVERS}" ]] && break
   for pid in "${server_pids[@]}"; do
     if ! kill -0 "${pid}" 2>/dev/null; then
-      echo "A policy server exited before readiness; inspect ${RUN_ROOT}/logs/server_worker*.log" >&2
+      echo "A policy server exited before readiness; inspect ${RUN_ROOT}/logs/server_gpu*.log" >&2
       exit 1
     fi
   done
   sleep 1
 done
-if [[ "${ready}" -ne "${NUM_SHARDS}" ]]; then
-  echo "Only ${ready}/${NUM_SHARDS} policy servers became ready within 300 seconds" >&2
+if [[ "${ready}" -ne "${NUM_POLICY_SERVERS}" ]]; then
+  echo "Only ${ready}/${NUM_POLICY_SERVERS} policy servers became ready within 300 seconds" >&2
   exit 1
 fi
 
@@ -224,7 +243,7 @@ for suite in "${suites[@]}"; do
       taskset -c "${cpu_set}" \
       "${PYTHON_BIN}" "${REPO_ROOT}/examples/libero/main.py" \
         --args.host 127.0.0.1 \
-        --args.port "$((PORT_BASE + shard))" \
+        --args.port "$((PORT_BASE + gpu))" \
         --args.task-suite-name "${suite}" \
         --args.task-ids "${task_ids[@]}" \
         --args.num-shards "${NUM_SHARDS}" \

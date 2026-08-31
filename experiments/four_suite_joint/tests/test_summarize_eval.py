@@ -9,7 +9,7 @@ from four_suite_experiments.summarize_eval import summarize_suite
 import pytest
 
 
-@pytest.mark.parametrize("num_shards", [8, 16])
+@pytest.mark.parametrize("num_shards", [8, 16, 24])
 def test_formal_suite_checkpoint_and_batch_summaries(tmp_path, num_shards: int) -> None:
     shard_paths = [tmp_path / f"shard_{index}.jsonl" for index in range(num_shards)]
     handles = [path.open("w", encoding="utf-8") for path in shard_paths]

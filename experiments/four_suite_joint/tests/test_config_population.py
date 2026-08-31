@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 from four_suite_experiments.configs import blocked_action_groups
 from four_suite_experiments.configs import build_train_config
@@ -197,6 +198,42 @@ def test_8gpu_launcher_uses_validated_allocator_settings() -> None:
     assert "export OPENPI_USE_DEFAULT_CUDA_ALLOCATOR=1" in text
     assert "export OPENPI_LOG_MEMORY_STATS=0" in text
     assert "export TOKENIZERS_PARALLELISM=false" in text
+
+
+def test_eval_launcher_routes_24_simulators_to_eight_policy_servers(tmp_path) -> None:
+    project = Path(__file__).resolve().parents[1]
+    launcher = project / "jobs/eval_checkpoint_8gpu.sh"
+    checkpoint = tmp_path / "30000"
+    (checkpoint / "assets/physical-intelligence/libero").mkdir(parents=True)
+    (checkpoint / "model.safetensors").write_bytes(b"model")
+    (checkpoint / "assets/physical-intelligence/libero/norm_stats.json").write_text("{}")
+    libero = tmp_path / "libero_source/libero/libero"
+    for directory in ("assets", "bddl_files", "init_files"):
+        (libero / directory).mkdir(parents=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "CHECKPOINT": str(checkpoint),
+            "RUN_ROOT": str(tmp_path / "run"),
+            "FOUR_SUITE_PYTHON": sys.executable,
+            "FOUR_SUITE_BASE_WEIGHTS": str(tmp_path / "base"),
+            "FOUR_SUITE_LIBERO_ASSETS": str(tmp_path / "assets"),
+            "LIBERO_EVAL_SOURCE_ROOT": str(tmp_path / "libero_source"),
+            "NUM_SHARDS": "24",
+            "DRY_RUN": "1",
+        }
+    )
+    result = subprocess.run(
+        ["bash", str(launcher)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert "8 policy servers and 24 simulator workers" in result.stdout
+    text = launcher.read_text()
+    assert "for gpu in $(seq 0 $((NUM_POLICY_SERVERS - 1)))" in text
+    assert '--args.port "$((PORT_BASE + gpu))"' in text
 
 
 def test_official_completion_continuation_is_one_continuous_6k_schedule(tmp_path) -> None:

@@ -60,6 +60,13 @@ environment steps, 10 initial wait steps, and 16 evaluation shards. Maximum
 episode lengths are 220 / 280 / 300 / 520 for Spatial / Object / Goal /
 LIBERO-10 respectively.
 
+The eight-GPU evaluator keeps one policy server per GPU and supports 8, 16, or
+24 simulator workers through `NUM_SHARDS`; extra simulators on the same GPU
+share its server. The default remains 16. On the validated 8 x A100 host, a
+short warmed-cache smoke measured essentially identical aggregate throughput
+for 16 and 24 workers, while 24 increased per-episode queueing latency. The
+published result above therefore retains its original 16-shard protocol.
+
 The public checkpoint archive is
 [`Zhiyuan17/libero40-trqc-checkpoints`](https://huggingface.co/Zhiyuan17/libero40-trqc-checkpoints).
 The adopted model is
