@@ -50,21 +50,38 @@ The release uses Python 3.11, the repository lockfile, the local Transformers
 replacement, and the same FP32-converted pi0.5 base contract as LIBERO. Do not
 substitute a BF16-converted base checkpoint.
 
-## Inputs kept outside Git
+## Data availability
 
-The training run requires:
+The exact 24-task `base50` HDF5 population is public on Hugging Face:
 
-1. RoboCasa Atomic-24 `base50` HDF5 policy data: 24 tasks and exactly 50
-   successful demonstrations per task;
-2. the immutable source manifests plus Semantic/Geometry/Motion cache produced
-   by the cache-tools repository;
-3. the strict FP32-converted pi0.5 PyTorch base;
-4. the generated per-task policy normalization statistics; and
-5. a writable checkpoint directory.
+- [`Zhiyuan17/robocasa24-atomic-success100-256`](https://huggingface.co/datasets/Zhiyuan17/robocasa24-atomic-success100-256)
+- pinned revision: `7236e704a04ebe477cc06d0a06ad540cd968fa5d`
+- training needs only `data/base50/**` (24 HDF5 files, 1,200 episodes,
+  332,859 frames, about 42.9 GiB).
 
-Task-relevant and Whole-scene source caches are converted locally into portable
-read-only memmaps by the preparation command. These generated `prepared/`
-directories are ignored by Git.
+The source manifests and complete task-relevant Semantic/Geometry/Motion cache
+are also public:
+
+- [`Zhiyuan17/robocasa24-cache-batch1-base50`](https://huggingface.co/datasets/Zhiyuan17/robocasa24-cache-batch1-base50)
+- pinned revision: `d1028edd9094ec7f61e42d40babf74d971113948`
+- about 2.61 GiB.
+
+The strict FP32-converted pi0.5 PyTorch base is already uploaded under
+`models/pi05_base_pytorch_fp32/` in the private dataset
+`Zhiyuan17/libero40-trqc-assets`, pinned at
+`84fd8b5849a976b08b36dc328141de88f483193a`. Authentication and access to that
+repository are required; do not download its unrelated LIBERO assets.
+
+The RoboCasa Whole-scene Geometry/Motion cache is **not currently published on
+Hugging Face**. Generate it with the cache-tools repository or transfer the
+validated cache before running the Whole-scene ablation. It reuses the public
+task-relevant Semantic cache and source manifests.
+
+Prepared memmaps and the exact equal-task-weight policy normalization are not
+uploaded. Both are deterministic CPU products generated on the training
+machine from the pinned inputs above. The detailed README provides selective
+download and preparation commands. No teacher checkpoints, segmentation masks,
+VGGT, or Track4World environment are needed once both source caches exist.
 
 See
 [`experiments/robocasa24_atomic/README.md`](experiments/robocasa24_atomic/README.md)

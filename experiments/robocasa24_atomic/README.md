@@ -61,6 +61,84 @@ synchronization, and disabled tokenizer thread fan-out. These settings only
 affect runtime allocation/logging behavior; model, losses, batches, precision,
 optimizer, and sampling remain unchanged.
 
+## Required data and exact sources
+
+Use immutable revisions rather than moving repository heads.
+
+| Required input | Source | Pinned revision | Required subset |
+|---|---|---|---|
+| Atomic-24 policy data | [`Zhiyuan17/robocasa24-atomic-success100-256`](https://huggingface.co/datasets/Zhiyuan17/robocasa24-atomic-success100-256) | `7236e704a04ebe477cc06d0a06ad540cd968fa5d` | `data/base50/**` |
+| Source manifests + task-relevant Semantic/Geometry/Motion | [`Zhiyuan17/robocasa24-cache-batch1-base50`](https://huggingface.co/datasets/Zhiyuan17/robocasa24-cache-batch1-base50) | `d1028edd9094ec7f61e42d40babf74d971113948` | complete repository |
+| Strict FP32 pi0.5 base | private dataset `Zhiyuan17/libero40-trqc-assets` | `84fd8b5849a976b08b36dc328141de88f483193a` | `models/pi05_base_pytorch_fp32/**` |
+| Whole-scene Geometry/Motion | not yet published on HF | n/a | validated Batch-1 Whole-scene cache |
+
+The HDF5 subset contains exactly 24 task files, 1,200 episodes, and 332,859
+frames (about 42.9 GiB). The task-relevant cache is about 2.61 GiB. The FP32
+base is about 13.5 GiB. Do not use the `success100` population, a different
+Human-50 selection, or a BF16-converted base.
+
+Create a machine-local asset layout and download only the required files:
+
+```bash
+export ROBOCASA24_ASSET_ROOT=/large_disk/robocasa24_assets
+export RAW_DATA_ROOT="$ROBOCASA24_ASSET_ROOT/raw"
+export TASK_CACHE_ROOT="$ROBOCASA24_ASSET_ROOT/cache/task_relevant"
+export WHOLE_CACHE_ROOT="$ROBOCASA24_ASSET_ROOT/cache/whole_scene"
+export MODEL_BUNDLE_ROOT="$ROBOCASA24_ASSET_ROOT/model_bundle"
+export POLICY_ASSETS_ROOT="$ROBOCASA24_ASSET_ROOT/policy_assets"
+export PREPARED_ROOT="$ROBOCASA24_ASSET_ROOT/prepared"
+export CHECKPOINT_ROOT="$ROBOCASA24_ASSET_ROOT/checkpoints"
+
+mkdir -p "$RAW_DATA_ROOT" "$TASK_CACHE_ROOT" "$WHOLE_CACHE_ROOT" \
+  "$MODEL_BUNDLE_ROOT" "$POLICY_ASSETS_ROOT" "$PREPARED_ROOT" \
+  "$CHECKPOINT_ROOT"
+
+uvx --from 'huggingface_hub>=1.0' hf download \
+  Zhiyuan17/robocasa24-atomic-success100-256 \
+  --repo-type dataset \
+  --revision 7236e704a04ebe477cc06d0a06ad540cd968fa5d \
+  --include 'data/base50/**' \
+  --local-dir "$RAW_DATA_ROOT"
+
+uvx --from 'huggingface_hub>=1.0' hf download \
+  Zhiyuan17/robocasa24-cache-batch1-base50 \
+  --repo-type dataset \
+  --revision d1028edd9094ec7f61e42d40babf74d971113948 \
+  --local-dir "$TASK_CACHE_ROOT"
+
+uvx --from 'huggingface_hub>=1.0' hf auth login
+uvx --from 'huggingface_hub>=1.0' hf download \
+  Zhiyuan17/libero40-trqc-assets \
+  --repo-type dataset \
+  --revision 84fd8b5849a976b08b36dc328141de88f483193a \
+  --include 'models/pi05_base_pytorch_fp32/**' \
+  --local-dir "$MODEL_BUNDLE_ROOT"
+```
+
+Then define the paths consumed by every training and validation command:
+
+```bash
+export DATA_ROOT="$RAW_DATA_ROOT/data/base50"
+export MANIFEST_ROOT="$TASK_CACHE_ROOT"
+export SEMANTIC_ROOT="$TASK_CACHE_ROOT"
+export GEOMETRY_ROOT="$TASK_CACHE_ROOT"
+export MOTION_ROOT="$TASK_CACHE_ROOT"
+export PI05_FP32_BASE="$MODEL_BUNDLE_ROOT/models/pi05_base_pytorch_fp32"
+```
+
+The Whole-scene cache is the only large research input not currently available
+from HF. Until a pinned repository/revision is published, place its 24 task
+directories under `$WHOLE_CACHE_ROOT`. It must contain validated
+`geometry/final` and `motion/final` outputs aligned to the same valid rows as
+the task-relevant cache. Generate it using
+[`robocasa-atomic24-cache-tools`](https://github.com/zhiyuan-gao/robocasa-atomic24-cache-tools)
+and its `WHOLE_SCENE_CACHE.md`; do not synthesize or substitute targets on the
+training machine.
+
+The following are deliberately not downloaded for training once the two cache
+roots exist: raw segmentation masks, teacher model checkpoints, VGGT,
+Track4World, worker shards, cache-generation logs, and `additional50` data.
+
 ## One-time CPU preparation
 
 `DATA_ROOT` may be either the dataset root containing
@@ -93,9 +171,23 @@ $ROBOCASA24_PYTHON -m robocasa24_finetune.prepare_artifacts \
   --output-dir "$PREPARED_ROOT/task_relevant"
 ```
 
-Use the same command with `--scope whole_scene` and the Whole-scene Geometry /
-Motion roots for the ablation. Source caches are never rewritten and an
-existing output directory is never overwritten.
+Prepare the Whole-scene control while reusing the identical source manifests
+and Semantic labels:
+
+```bash
+$ROBOCASA24_PYTHON -m robocasa24_finetune.prepare_artifacts \
+  --scope whole_scene \
+  --manifest-root "$MANIFEST_ROOT" \
+  --semantic-root "$SEMANTIC_ROOT" \
+  --geometry-root "$WHOLE_CACHE_ROOT" \
+  --motion-root "$WHOLE_CACHE_ROOT" \
+  --output-dir "$PREPARED_ROOT/whole_scene"
+```
+
+Source caches are never rewritten and an existing output directory is never
+overwritten. The generated prepared directories are portable and together use
+about 6.2 GB. They are intentionally not stored in Git or HF because they can
+be reconstructed deterministically from the smaller source caches.
 
 Run the read-only population, HDF5, norm-stat, and target-alignment audit:
 
@@ -106,6 +198,10 @@ $ROBOCASA24_PYTHON -m robocasa24_finetune.validate \
   --policy-assets-root "$POLICY_ASSETS_ROOT" \
   --artifact-dir "$PREPARED_ROOT/task_relevant"
 ```
+
+Repeat the validator with `--artifact-dir "$PREPARED_ROOT/whole_scene"` before
+the Whole-scene smoke. The expected policy population is 24 tasks, 1,200
+episodes, and 332,859 frames.
 
 ## Dry run, smoke, and formal training
 
