@@ -58,6 +58,7 @@ def test_trajectory_config_ignores_runtime_controls_but_not_recipe(tmp_path) -> 
         checkpoint_keep_steps=(1, 4),
         max_checkpoints_to_keep=8,
         max_resume_checkpoints_to_keep=2,
+        resume_checkpoint_keep_steps=(1,),
         log_interval=1,
         resume=True,
         wandb_enabled=True,
@@ -93,6 +94,35 @@ def test_four_suite_late_dense_schedule_retains_final_thirty(tmp_path) -> None:
     expected_retained = [*range(11_000, 20_001, 1_000), *range(20_500, 30_001, 500)]
     assert removed == list(range(1_000, 10_001, 1_000))
     assert sorted(int(path.name) for path in config.checkpoint_dir.iterdir()) == expected_retained
+
+
+def test_robocasa_main_checkpoint_schedule_and_evaluation_retention(tmp_path) -> None:
+    evaluation_steps = (20_000, *range(25_000, 30_001, 500))
+    config = _config_for_checkpoint(
+        tmp_path,
+        num_train_steps=30_000,
+        save_interval=1_000,
+        late_save_interval=500,
+        late_save_start_step=25_000,
+        keep_period=None,
+        checkpoint_keep_steps=evaluation_steps,
+        max_checkpoints_to_keep=4,
+        max_resume_checkpoints_to_keep=4,
+        resume_checkpoint_keep_steps=(20_000,),
+    )
+    scheduled = [step for step in range(1, 30_001) if train_pytorch.should_save_checkpoint(step, config)]
+    assert scheduled == [*range(1_000, 25_001, 1_000), *range(25_500, 30_001, 500)]
+
+    for step in scheduled:
+        (config.checkpoint_dir / str(step)).mkdir()
+    removed = train_pytorch.prune_checkpoints(
+        config.checkpoint_dir,
+        keep_period=config.keep_period,
+        keep_steps=config.checkpoint_keep_steps,
+        max_to_keep=config.max_checkpoints_to_keep,
+    )
+    assert removed == [*range(1_000, 20_000, 1_000), *range(21_000, 25_000, 1_000)]
+    assert sorted(int(path.name) for path in config.checkpoint_dir.iterdir()) == list(evaluation_steps)
 
 
 def test_prune_checkpoints_preserves_periodic_and_latest(tmp_path) -> None:
@@ -169,6 +199,29 @@ def test_demote_old_resume_checkpoints_preserves_evaluation_weights(tmp_path) ->
     assert not any(train_pytorch.checkpoint_is_resumable(tmp_path / str(step)) for step in steps[:-2])
     assert train_pytorch.checkpoint_is_resumable(tmp_path / "29000")
     assert train_pytorch.checkpoint_is_resumable(tmp_path / "30000")
+
+
+def test_demote_resume_checkpoints_preserves_fixed_milestone_within_total_cap(tmp_path) -> None:
+    steps = (20_000, 28_500, 29_000, 29_500, 30_000)
+    for step in steps:
+        checkpoint = tmp_path / str(step)
+        checkpoint.mkdir()
+        for name in ("model.safetensors", "optimizer.pt", "training_state.pt", "metadata.pt"):
+            (checkpoint / name).write_bytes(b"test")
+
+    demoted = train_pytorch.demote_old_resume_checkpoints(
+        tmp_path,
+        max_to_keep=4,
+        keep_steps=(20_000,),
+    )
+
+    assert demoted == [28_500]
+    assert {step for step in steps if train_pytorch.checkpoint_is_resumable(tmp_path / str(step))} == {
+        20_000,
+        29_000,
+        29_500,
+        30_000,
+    }
 
 
 def test_save_checkpoint_keeps_all_models_and_latest_two_resume_states(tmp_path, monkeypatch) -> None:

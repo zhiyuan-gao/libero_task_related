@@ -24,6 +24,7 @@ from .constants import TASKS
 from .integration import RoboCasaDataConfigFactory
 
 Variant = Literal["baseline", "task_relevant", "whole_scene"]
+CheckpointPolicy = Literal["rolling", "main_eval_dense"]
 
 
 def _validate_fp32_base(base_weight_dir: Path) -> None:
@@ -88,6 +89,7 @@ def build_train_config(
     warmup_steps: int = 10_000,
     save_interval: int = 1_000,
     max_checkpoints_to_keep: int | None = 4,
+    checkpoint_policy: CheckpointPolicy = "rolling",
     resume: bool = False,
     overwrite: bool = False,
     wandb_enabled: bool = True,
@@ -101,6 +103,8 @@ def build_train_config(
         raise ValueError("worker count/save interval is invalid")
     if max_checkpoints_to_keep is not None and max_checkpoints_to_keep <= 0:
         raise ValueError("checkpoint retention must be positive when set")
+    if checkpoint_policy not in ("rolling", "main_eval_dense"):
+        raise ValueError(f"unsupported checkpoint policy: {checkpoint_policy}")
     if global_micro_batch * gradient_accumulation_steps != 128:
         raise ValueError("effective global batch must remain exactly 128")
     if global_micro_batch % 8 != 0:
@@ -141,6 +145,13 @@ def build_train_config(
     # the experiment independent of any later LIBERO-only named config.
     base = openpi_config.get_config("pi05_libero3_p3_binary_ground_aux")
     population_name = "robocasa24" if tasks == TASKS else f"robocasa{len(tasks)}"
+    dense_eval_steps = tuple(range(25_000, 30_001, 500))
+    checkpoint_keep_steps = (
+        (20_000, *dense_eval_steps)
+        if checkpoint_policy == "main_eval_dense"
+        else ()
+    )
+    resume_checkpoint_keep_steps = (20_000,) if checkpoint_policy == "main_eval_dense" else ()
     return dataclasses.replace(
         base,
         name=f"pi05_{population_name}_{variant}",
@@ -172,13 +183,14 @@ def build_train_config(
         num_train_steps=30_000,
         log_interval=100,
         save_interval=save_interval,
-        late_save_interval=None,
-        late_save_start_step=None,
+        late_save_interval=500 if checkpoint_policy == "main_eval_dense" else None,
+        late_save_start_step=25_000 if checkpoint_policy == "main_eval_dense" else None,
         save_final_checkpoint=True,
         keep_period=None,
-        checkpoint_keep_steps=(),
+        checkpoint_keep_steps=checkpoint_keep_steps,
         max_checkpoints_to_keep=max_checkpoints_to_keep,
         max_resume_checkpoints_to_keep=max_checkpoints_to_keep,
+        resume_checkpoint_keep_steps=resume_checkpoint_keep_steps,
         checkpoint_base_dir=str(Path(checkpoint_base_dir).resolve()),
         policy_metadata={
             "benchmark": "RoboCasa Atomic-24",
@@ -196,6 +208,9 @@ def build_train_config(
             "predicted_action_horizon": ACTION_HORIZON,
             "execution_horizon": EXECUTION_HORIZON,
             "base_checkpoint": "official pi05_base FP32-converted PyTorch",
+            "checkpoint_policy": checkpoint_policy,
+            "evaluation_checkpoint_steps": list(checkpoint_keep_steps),
+            "protected_resume_checkpoint_steps": list(resume_checkpoint_keep_steps),
         },
         resume=resume,
         overwrite=overwrite,

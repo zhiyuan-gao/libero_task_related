@@ -546,6 +546,10 @@ class TrainConfig:
     # checkpoints remain evaluable, but their optimizer, RNG/DataLoader, and
     # (when EMA is enabled) raw training-weight files are removed.
     max_resume_checkpoints_to_keep: int | None = None
+    # Exact milestones whose full optimizer/RNG/DataLoader continuation state
+    # must survive resume-state demotion. These steps must also be protected by
+    # ``checkpoint_keep_steps`` so ordinary directory pruning cannot remove them.
+    resume_checkpoint_keep_steps: tuple[int, ...] = ()
 
     # If true, will overwrite the checkpoint directory if it already exists.
     overwrite: bool = False
@@ -598,6 +602,17 @@ class TrainConfig:
             raise ValueError("max_checkpoints_to_keep must be positive when set")
         if self.max_resume_checkpoints_to_keep is not None and self.max_resume_checkpoints_to_keep <= 0:
             raise ValueError("max_resume_checkpoints_to_keep must be positive when set")
+        if any(step <= 0 for step in self.resume_checkpoint_keep_steps) or len(
+            set(self.resume_checkpoint_keep_steps)
+        ) != len(self.resume_checkpoint_keep_steps):
+            raise ValueError("resume_checkpoint_keep_steps must contain unique positive optimizer steps")
+        if not set(self.resume_checkpoint_keep_steps).issubset(self.checkpoint_keep_steps):
+            raise ValueError("resume checkpoint milestones must also be protected checkpoint milestones")
+        if (
+            self.max_resume_checkpoints_to_keep is not None
+            and len(self.resume_checkpoint_keep_steps) > self.max_resume_checkpoints_to_keep
+        ):
+            raise ValueError("protected resume milestones exceed the resume checkpoint retention cap")
         frozen_policy_aux = {
             "pi05_libero_p1_aux": {
                 "mode": "geometry",

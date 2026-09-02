@@ -43,6 +43,26 @@ def test_three_tasks_twenty_four_workers_partition_episodes() -> None:
     assert observed == expected
 
 
+def test_atomic24_forty_eight_workers_partition_each_task_twice() -> None:
+    assignments = [
+        episode_shard_for_worker(TASKS, 48, worker) for worker in range(48)
+    ]
+    for task in TASKS:
+        task_assignments = [
+            assignment for assignment in assignments if assignment[0] == task
+        ]
+        assert task_assignments == [(task, 0, 2), (task, 1, 2)]
+
+    observed = {
+        (task, episode_idx)
+        for task, shard_index, shard_count in assignments
+        for episode_idx in range(50)
+        if episode_idx % shard_count == shard_index
+    }
+    expected = {(task, episode_idx) for task in TASKS for episode_idx in range(50)}
+    assert observed == expected
+
+
 def test_episode_sharding_rejects_fewer_workers_than_tasks() -> None:
     with pytest.raises(ValueError, match="at least one worker per task"):
         episode_shard_for_worker(TASKS[:3], 2, 0)

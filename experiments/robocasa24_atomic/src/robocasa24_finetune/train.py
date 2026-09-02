@@ -75,6 +75,7 @@ def main() -> None:
         num_workers=args.num_workers,
         save_interval=args.save_interval,
         max_checkpoints_to_keep=args.max_checkpoints_to_keep,
+        checkpoint_policy="main_eval_dense" if args.variant == "task_relevant" else "rolling",
         resume=args.resume,
         overwrite=args.overwrite,
         wandb_enabled=not args.disable_wandb,
@@ -94,6 +95,11 @@ def main() -> None:
         "ema": config.ema_decay,
         "save_interval": config.save_interval,
         "max_checkpoints_to_keep": config.max_checkpoints_to_keep,
+        "max_resume_checkpoints_to_keep": config.max_resume_checkpoints_to_keep,
+        "checkpoint_keep_steps": list(config.checkpoint_keep_steps),
+        "resume_checkpoint_keep_steps": list(config.resume_checkpoint_keep_steps),
+        "late_save_start_step": config.late_save_start_step,
+        "late_save_interval": config.late_save_interval,
         "checkpoint_dir": str(config.checkpoint_dir),
     }
     print(json.dumps(manifest, indent=2, sort_keys=True), flush=True)

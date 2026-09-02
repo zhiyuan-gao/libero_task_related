@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from robocasa24_finetune.ablations.configs import ABLATION_KEEP_PERIOD
+from robocasa24_finetune.ablations.configs import ABLATION_SAVE_INTERVAL
 from robocasa24_finetune.ablations.model import AblationPrefixLayout
 from robocasa24_finetune.ablations.model import build_ablation_joint_attention
 from robocasa24_finetune.ablations.model import build_ablation_joint_position_ids
@@ -43,6 +45,16 @@ def test_six_ablation_specs_are_complete_and_matched() -> None:
     assert ABLATION_SPECS["semantic_motion"].action_conditioning == ("motion",)
     assert ABLATION_SPECS["supervision_only"].action_conditioning == ()
     assert ABLATION_SPECS["whole_scene"].target_scope == "whole_scene"
+
+
+def test_ablation_checkpoint_retention_matches_periodic_style() -> None:
+    assert ABLATION_SAVE_INTERVAL == 1_000
+    assert ABLATION_KEEP_PERIOD == 5_000
+    scheduled = list(range(ABLATION_SAVE_INTERVAL, 28_001, ABLATION_SAVE_INTERVAL))
+    protected = {step for step in scheduled if step % ABLATION_KEEP_PERIOD == 0}
+    retained = protected | {scheduled[-1]}
+    expected = {5_000, 10_000, 15_000, 20_000, 25_000, 28_000}
+    assert retained == expected
 
 
 def test_full_action_reads_both_queries_but_not_semantic_teacher() -> None:

@@ -218,6 +218,7 @@ _RESUME_RUNTIME_FIELDS = {
     "log_interval",
     "max_checkpoints_to_keep",
     "max_resume_checkpoints_to_keep",
+    "resume_checkpoint_keep_steps",
     "num_train_steps",
     "overwrite",
     "resume",
@@ -272,7 +273,12 @@ def checkpoint_is_resumable(path) -> bool:
     return all((path / name).is_file() for name in required) and (has_training_model or has_standard_model)
 
 
-def demote_old_resume_checkpoints(checkpoint_dir, *, max_to_keep: int | None) -> list[int]:
+def demote_old_resume_checkpoints(
+    checkpoint_dir,
+    *,
+    max_to_keep: int | None,
+    keep_steps: tuple[int, ...] = (),
+) -> list[int]:
     """Keep exact continuation only for the newest checkpoints.
 
     Demotion happens only after a new checkpoint has been atomically published.
@@ -286,8 +292,18 @@ def demote_old_resume_checkpoints(checkpoint_dir, *, max_to_keep: int | None) ->
         for path in checkpoint_dir.iterdir()
         if path.is_dir() and path.name.isdigit() and checkpoint_is_resumable(path)
     )
+    requested_protected = set(keep_steps)
+    protected = {step for step, _ in resumable if step in requested_protected}
+    if len(protected) > max_to_keep:
+        raise ValueError("protected resume milestones exceed the resume checkpoint retention cap")
+    ordinary = [step for step, _ in resumable if step not in protected]
+    rolling_slots = max_to_keep - len(protected)
+    rolling = set(ordinary[-rolling_slots:]) if rolling_slots > 0 else set()
+    retained = protected | rolling
     demoted = []
-    for step, path in resumable[:-max_to_keep]:
+    for step, path in resumable:
+        if step in retained:
+            continue
         if not (path / "model.safetensors").is_file():
             raise FileNotFoundError(f"Refusing to demote checkpoint without evaluation weights: {path}")
         for name in (*_EXACT_RESUME_FILES, "train_model.safetensors"):
@@ -409,6 +425,7 @@ def save_checkpoint(
     demoted = demote_old_resume_checkpoints(
         config.checkpoint_dir,
         max_to_keep=config.max_resume_checkpoints_to_keep,
+        keep_steps=config.resume_checkpoint_keep_steps,
     )
     if demoted:
         logging.info(f"Demoted old checkpoints to evaluation-only: {demoted}")

@@ -19,7 +19,7 @@ experiment package or `robocasa24_cache_tools`.
 | LR | peak `5e-5`, 10,000-update warmup, cosine to `5e-6` |
 | Parallelism | eight-GPU DDP (`fsdp_devices=1`) |
 | EMA | disabled |
-| Checkpoints | save every 1,000; safely retain the latest 4 full resume states by default |
+| Checkpoints | every 1,000 through 25k, then every 500; retain 20k + all 25k--30k evaluation weights; retain 20k + latest 3 full resume states |
 
 Matched variants:
 
@@ -69,7 +69,7 @@ Use immutable revisions rather than moving repository heads.
 |---|---|---|---|
 | Atomic-24 policy data | [`Zhiyuan17/robocasa24-atomic-success100-256`](https://huggingface.co/datasets/Zhiyuan17/robocasa24-atomic-success100-256) | `7236e704a04ebe477cc06d0a06ad540cd968fa5d` | `data/base50/**` |
 | Source manifests + task-relevant Semantic/Geometry/Motion | [`Zhiyuan17/robocasa24-cache-batch1-base50`](https://huggingface.co/datasets/Zhiyuan17/robocasa24-cache-batch1-base50) | `d1028edd9094ec7f61e42d40babf74d971113948` | complete repository |
-| Strict FP32 pi0.5 base | private dataset `Zhiyuan17/libero40-trqc-assets` | `84fd8b5849a976b08b36dc328141de88f483193a` | `models/pi05_base_pytorch_fp32/**` |
+| Strict FP32 pi0.5 base | public dataset `Zhiyuan17/libero40-trqc-assets` | `84fd8b5849a976b08b36dc328141de88f483193a` | `models/pi05_base_pytorch_fp32/**` |
 | Whole-scene Geometry/Motion | not yet published on HF | n/a | validated Batch-1 Whole-scene cache |
 
 The HDF5 subset contains exactly 24 task files, 1,200 episodes, and 332,859
@@ -106,7 +106,6 @@ uvx --from 'huggingface_hub>=1.0' hf download \
   --revision d1028edd9094ec7f61e42d40babf74d971113948 \
   --local-dir "$TASK_CACHE_ROOT"
 
-uvx --from 'huggingface_hub>=1.0' hf auth login
 uvx --from 'huggingface_hub>=1.0' hf download \
   Zhiyuan17/libero40-trqc-assets \
   --repo-type dataset \
@@ -229,9 +228,13 @@ Do not set either approval variable until all eight GPUs are free and the
 read-only validator has returned `PASS`.
 
 Each full checkpoint includes both model and AdamW state (about 21 GB with the
-current model), so the default rolling retention is deliberate. Pass
-`--max-checkpoints-to-keep N` only after checking disk space and deciding the
-evaluation grid.
+current model). The main task-relevant run saves every 1,000 updates through
+25k and every 500 updates after 25k. The 20k checkpoint is permanently kept
+with complete resume state. Evaluation weights are permanently kept at 20k
+and at `25k, 25.5k, ..., 30k`; older late checkpoints are demoted to
+evaluation-only form. The total complete resume-state cap is four, comprising
+20k plus the latest three checkpoints. Checkpoints from 21k--24k follow the
+ordinary rolling policy and are eventually removed.
 
 ## Multi-worker closed-loop evaluation
 
@@ -246,10 +249,12 @@ Policy inference and simulation use separate environments. The default launcher
 starts eight policy servers (one checkpoint copy per A100) and eight RoboCasa
 simulator workers. Every worker owns complete tasks rather than arbitrary
 episodes, preserving each task's seeded reset stream. `NUM_WORKERS` is
-configurable up to 24. For reduced task populations, `SHARD_MODE=episode`
-divides the workers into near-equal groups per task and shards that task's
-episodes across the group. Every shard still performs all resets in canonical
-order, so parallelism does not change the seeded episode population.
+configurable up to 48. `SHARD_MODE=episode` can use 48 workers for the full
+Atomic-24 population, assigning two episode shards to every task. For reduced
+task populations, `SHARD_MODE=episode` divides the workers into near-equal
+groups per task and shards that task's episodes across the group. Every shard
+still performs all resets in canonical order, so parallelism does not change
+the seeded episode population.
 
 Prepare the pinned simulator once. Asset download is about 5 GB:
 

@@ -32,7 +32,7 @@ for integer in "$port_base" "$num_gpus" "$num_workers" "$eval_seed" "$trials_per
   [[ "$integer" =~ ^[0-9]+$ ]] || { echo "Expected a non-negative integer, found: $integer" >&2; exit 1; }
 done
 (( num_gpus >= 1 && num_gpus <= 8 )) || { echo "NUM_GPUS must be in [1,8]" >&2; exit 1; }
-(( num_workers >= 1 && num_workers <= 24 )) || { echo "NUM_WORKERS must be in [1,24]" >&2; exit 1; }
+(( num_workers >= 1 && num_workers <= 48 )) || { echo "NUM_WORKERS must be in [1,48]" >&2; exit 1; }
 (( execution_horizon >= 1 && execution_horizon <= 50 )) || {
   echo "EXECUTION_HORIZON must be in [1,50]" >&2
   exit 1

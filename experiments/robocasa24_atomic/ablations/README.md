@@ -5,6 +5,9 @@ This directory documents the isolated implementation under
 training entrypoint or the existing task-relevant / Whole-scene cache
 generators.
 
+新 8-GPU 机器的中文端到端运行手册见
+[`RUN_ABLATIONS_8GPU_ZH.md`](RUN_ABLATIONS_8GPU_ZH.md)。
+
 ## Matched variants
 
 | CLI name | Auxiliary losses | Action Expert reads | Target scope |
@@ -28,6 +31,25 @@ Atomic-24 Human-50 population, three cameras, task-alpha sampling, z-score
 normalization, FP32-converted pi0.5 initialization, 50-step action prediction,
 global batch 128, 30k optimizer updates, 10k warmup, BF16 AdamW, no EMA, and
 8-GPU DDP.
+
+## Checkpoint retention
+
+Every formal ablation uses the official periodic-retention style. A checkpoint
+is written every 1,000 optimizer updates. Multiples of 5,000 are protected for
+the lifetime of the run, while non-multiples of 5,000 are rolling and only the
+latest one is retained. Every retained checkpoint keeps its complete optimizer,
+RNG, and DataLoader state and can therefore resume training exactly.
+
+For example, immediately after update 28,000 the retained set is:
+
+```text
+5k, 10k, 15k, 20k, 25k  # protected periodic checkpoints
+28k                       # latest ordinary checkpoint
+```
+
+At the end of the 30k run the retained set is `5k, 10k, 15k, 20k, 25k, 30k`.
+This retention policy is fixed by the ablation config and has no formal-training
+CLI override.
 
 The formal ablation queue contains only:
 

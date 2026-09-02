@@ -57,7 +57,7 @@ def main() -> None:
         log_interval=1,
         save_interval=10_000,
         save_final_checkpoint=False,
-        max_checkpoints_to_keep=1,
+        max_checkpoints_to_keep=None,
         overwrite=True,
         resume=False,
     )

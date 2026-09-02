@@ -30,8 +30,6 @@ def main() -> None:
     parser.add_argument("--global-micro-batch", type=int, default=128)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=2)
-    parser.add_argument("--save-interval", type=int, default=1000)
-    parser.add_argument("--max-checkpoints-to-keep", type=int, default=4)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--disable-wandb", action="store_true")
@@ -53,8 +51,6 @@ def main() -> None:
         global_micro_batch=args.global_micro_batch,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_workers=args.num_workers,
-        save_interval=args.save_interval,
-        max_checkpoints_to_keep=args.max_checkpoints_to_keep,
         resume=args.resume,
         overwrite=args.overwrite,
         wandb_enabled=not args.disable_wandb,
@@ -80,6 +76,10 @@ def main() -> None:
         "warmup_updates": config.lr_schedule.warmup_steps,
         "peak_lr": config.lr_schedule.peak_lr,
         "ema": config.ema_decay,
+        "checkpoint_save_interval": config.save_interval,
+        "checkpoint_keep_period": config.keep_period,
+        "ordinary_checkpoints_to_keep": 1,
+        "resume_state": "all retained checkpoints",
         "checkpoint_dir": str(config.checkpoint_dir),
     }
     print(json.dumps(manifest, indent=2, sort_keys=True), flush=True)

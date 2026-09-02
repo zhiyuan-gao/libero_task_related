@@ -67,10 +67,10 @@ are also public:
 - about 2.61 GiB.
 
 The strict FP32-converted pi0.5 PyTorch base is already uploaded under
-`models/pi05_base_pytorch_fp32/` in the private dataset
+`models/pi05_base_pytorch_fp32/` in the public dataset
 `Zhiyuan17/libero40-trqc-assets`, pinned at
-`84fd8b5849a976b08b36dc328141de88f483193a`. Authentication and access to that
-repository are required; do not download its unrelated LIBERO assets.
+`84fd8b5849a976b08b36dc328141de88f483193a`. No Hugging Face authentication is
+required; do not download its unrelated LIBERO assets.
 
 The RoboCasa Whole-scene Geometry/Motion cache is **not currently published on
 Hugging Face**. Generate it with the cache-tools repository or transfer the

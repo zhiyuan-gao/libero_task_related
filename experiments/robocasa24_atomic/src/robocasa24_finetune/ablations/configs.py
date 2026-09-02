@@ -13,6 +13,9 @@ from ..constants import TASKS
 from .specs import AblationVariant
 from .specs import get_ablation_spec
 
+ABLATION_SAVE_INTERVAL = 1_000
+ABLATION_KEEP_PERIOD = 5_000
+
 
 @dataclasses.dataclass(frozen=True)
 class AblationAuxTrainConfig:
@@ -145,8 +148,6 @@ def build_ablation_train_config(
     num_workers: int = 2,
     num_train_steps: int = 30_000,
     warmup_steps: int = 10_000,
-    save_interval: int = 1_000,
-    max_checkpoints_to_keep: int | None = 4,
     resume: bool = False,
     overwrite: bool = False,
     wandb_enabled: bool = True,
@@ -171,8 +172,11 @@ def build_ablation_train_config(
         num_workers=num_workers,
         num_train_steps=num_train_steps,
         warmup_steps=warmup_steps,
-        save_interval=save_interval,
-        max_checkpoints_to_keep=max_checkpoints_to_keep,
+        save_interval=ABLATION_SAVE_INTERVAL,
+        # Match the official periodic-retention style: the checkpointer treats
+        # None as "latest ordinary checkpoint only", in addition to periodic
+        # milestones protected by keep_period.
+        max_checkpoints_to_keep=None,
         resume=resume,
         overwrite=overwrite,
         wandb_enabled=wandb_enabled,
@@ -198,6 +202,11 @@ def build_ablation_train_config(
         lambda_geo=spec.lambda_geo,
         lambda_sem=spec.lambda_sem,
         lambda_motion=spec.lambda_motion,
+        checkpoint_policy="periodic_5k_plus_latest",
+        checkpoint_save_interval=ABLATION_SAVE_INTERVAL,
+        checkpoint_keep_period=ABLATION_KEEP_PERIOD,
+        checkpoint_ordinary_retention=1,
+        checkpoint_resume_state="all retained checkpoints",
     )
     population_name = "robocasa24" if tuple(tasks) == TASKS else f"robocasa{len(tasks)}"
     return dataclasses.replace(
@@ -206,4 +215,12 @@ def build_ablation_train_config(
         project_name="robocasa24-pi05-ablations",
         policy_aux=aux,
         policy_metadata=metadata,
+        save_interval=ABLATION_SAVE_INTERVAL,
+        late_save_interval=None,
+        late_save_start_step=None,
+        keep_period=ABLATION_KEEP_PERIOD,
+        checkpoint_keep_steps=(),
+        max_checkpoints_to_keep=None,
+        max_resume_checkpoints_to_keep=None,
+        resume_checkpoint_keep_steps=(),
     )
